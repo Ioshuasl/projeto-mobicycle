@@ -1,0 +1,100 @@
+services:
+  db:
+    image: mysql:8.0
+    container_name: mobicyclo-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpass123}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-mobicyclo}
+      MYSQL_USER: ${MYSQL_USER:-mobicyclo}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-mobicyclo123}
+    ports:
+      - "${DB_EXTERNAL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --innodb_buffer_pool_size=1G --innodb_log_file_size=256M --max_connections=200
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - mobicyclo-net
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mobicyclo-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: ${MYSQL_USER:-mobicyclo}
+      DB_PASSWORD: ${MYSQL_PASSWORD:-mobicyclo123}
+      DB_NAME: ${MYSQL_DATABASE:-mobicyclo}
+      DB_POOL_SIZE: 50
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+    env_file:
+      - .env
+    ports:
+      - "${BACKEND_PORT:-3000}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - mobicyclo-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: mobicyclo-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - mobicyclo-net
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: mobicyclo-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+      - "443:443"
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - backend
+    networks:
+      - mobicyclo-net
+
+  dozzle:
+    image: amir20/dozzle:latest
+    container_name: mobicyclo-dozzle
+    restart: unless-stopped
+    environment:
+      - DOZZLE_BASE=/monitor
+      - DOZZLE_AUTH_PROVIDER=simple
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./users.yml:/data/users.yml:ro
+    networks:
+      - mobicyclo-net
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  mobicyclo-net:
+    driver: bridge

@@ -1,0 +1,7 @@
+users:
+    zecarlos:
+        email: consultorcredenciado@gmail.com
+        name: Ze Carlos
+        password: $2a$11$7vAeiDBrDnQhFlfQtkQds.SxQwxGMmoxlwjeSb6u9SI5ShmDW6FAW
+        filter: ""
+        roles: ""

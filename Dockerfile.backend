@@ -1,0 +1,26 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Instala dependências
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# Copia arquivos do backend
+COPY server.ts email.ts tsconfig.json ./
+COPY src/server/ src/server/
+
+# S19: Run as non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+RUN chown -R appuser:appgroup /app
+USER appuser
+
+# Expõe a porta da API
+EXPOSE 3000
+
+# Variáveis de ambiente padrão
+ENV NODE_ENV=production
+ENV PORT=3000
+
+# Inicia o servidor com PM2 no modo Cluster (Max CPUs)
+CMD ["npx", "pm2-runtime", "start", "server.ts", "--interpreter", "tsx", "-i", "max"]

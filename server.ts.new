@@ -1,0 +1,2127 @@
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { sendNotificationEmail } from "./email.ts";
+import { parseStringPromise } from 'xml2js';
+import { GoogleGenAI } from "@google/genai";
+
+import { db, hashPassword, getSetting, ensureSetting, generateId } from "./src/server/db.ts";
+import { NotificationManager } from "./src/server/notificationManager.ts";
+import { AchievementManager } from "./src/server/achievementManager.ts";
+import { FinancialManager } from "./src/server/financialManager.ts";
+import { MatrixManager } from "./src/server/matrixManager.ts";
+import { UserManager } from "./src/server/userManager.ts";
+import { validateCPF, generateReferralCode, updateCareerLevel } from "./src/server/utils.ts";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const SESE_CNPJ = "47.123.456/0001-89";
+
+async function startServer() {
+  // Update career levels for all users on startup
+  const allUsers = db.prepare("SELECT id FROM users").all() as any[];
+  for (const u of allUsers) {
+    updateCareerLevel(u.id);
+  }
+
+  // Ensure all users have a referral code
+  const usersWithoutCode = db.prepare("SELECT id, name FROM users WHERE referral_code IS NULL").all() as any[];
+  for (const user of usersWithoutCode) {
+    const code = generateReferralCode(user.name || 'USER');
+    db.prepare("UPDATE users SET referral_code = ? WHERE id = ?").run(code, user.id);
+  }
+
+  const app = express();
+  const PORT = 3000;
+
+  // Security Middlewares
+  const authenticateUser = (req: any, res: any, next: any) => {
+    const userId = req.headers['x-user-id'] as string;
+    if (!userId || userId === 'null' || userId === 'undefined') {
+      return res.status(401).json({ error: "Não autenticado" });
+    }
+    
+    const user = db.prepare("SELECT id, role, email, status FROM users WHERE id = ?").get(userId) as any;
+    if (!user) {
+      return res.status(401).json({ error: "Não autenticado" });
+    }
+    
+    req.user = user;
+    next();
+  };
+
+  const isUserAdmin = (user: any) => {
+    if (!user) return false;
+    return user.role === 'admin' || 
+           user.email === 'consultorcredenciado@gmail.com' || 
+           user.email === 'admin@wayfy.com' ||
+           user.status === 'MASTER';
+  };
+
+  const authorizeAdmin = (req: any, res: any, next: any) => {
+    if (!isUserAdmin(req.user)) {
+      return res.status(403).json({ error: "Acesso negado. Apenas administradores podem realizar esta ação." });
+    }
+    next();
+  };
+
+  // SYSTEM RESET (UNCOMMENT TO RESET)
+  /*
+  try {
+    console.log("DEBUG: [STARTUP] FORCE RESET triggered");
+    db.transaction(() => {
+      db.prepare("DELETE FROM matrix_positions").run();
+      db.prepare("DELETE FROM matrices").run();
+      db.prepare("DELETE FROM matrix_cycles").run();
+      db.prepare("DELETE FROM transactions").run();
+      db.prepare("DELETE FROM notifications").run();
+      db.prepare("DELETE FROM documents").run();
+      db.prepare("DELETE FROM vouchers").run();
+      db.prepare("DELETE FROM badges").run();
+      db.prepare("DELETE FROM user_badges").run();
+      db.prepare("DELETE FROM matrix_history").run();
+      db.prepare("DELETE FROM users WHERE id NOT LIKE 'sys_%' AND email != 'consultorcredenciado@gmail.com'").run();
+      db.prepare("UPDATE users SET balance = 0, debt_balance = 0, cashback_balance = 0, voucher_balance = 0, referrals_count = 0, cycle_sales_count = 0, stars = 0, career_level = 'NONE', status = 'PARTNER', cashboard_qualified_referrals = 0").run();
+      db.prepare("UPDATE users SET status = 'MASTER' WHERE id LIKE 'sys_%' OR email = 'consultorcredenciado@gmail.com'").run();
+
+      // Create initial matrices
+      const onbordId = "matrix_onbord_initial";
+      const cashboardId = "matrix_cashboard_initial";
+      
+      db.prepare("INSERT INTO matrices (id, type, status) VALUES (?, ?, ?)").run(onbordId, 'ONBORD', 'OPEN');
+      db.prepare("INSERT INTO matrices (id, type, status) VALUES (?, ?, ?)").run(cashboardId, 'CASHBOARD', 'OPEN');
+
+      // Position admin in matrices
+      db.prepare("INSERT INTO matrix_positions (matrix_id, user_id, position) VALUES (?, ?, ?)").run(onbordId, 'sys_admin_001', 1);
+      db.prepare("INSERT INTO matrix_positions (matrix_id, user_id, position) VALUES (?, ?, ?)").run(cashboardId, 'sys_admin_001', 1);
+    })();
+    console.log("DEBUG: [STARTUP] Reset complete");
+  } catch (err) {
+    console.error("Error during startup reset:", err);
+  }
+  */
+
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+  // API Routes
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", env: process.env.NODE_ENV });
+  });
+
+  app.post("/api/auth/forgot-password", (req, res) => {
+    try {
+      const { email, cpf } = req.body;
+      const user = db.prepare("SELECT id FROM users WHERE email = ? AND cpf = ?").get(email, cpf) as any;
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado com estes dados" });
+      }
+      // In a real app, we would send a token via email. 
+      // For this prototype, we'll return a temporary reset token (which is just the userId for now, but we'll secure the reset route)
+      res.json({ success: true, resetToken: user.id });
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao processar recuperação" });
+    }
+  });
+
+  app.post("/api/auth/reset-password", (req, res) => {
+    try {
+      const { resetToken, newPassword } = req.body;
+      if (!resetToken || !newPassword) {
+        return res.status(400).json({ error: "Dados incompletos" });
+      }
+      
+      // In this prototype, resetToken is the userId. 
+      // We should at least verify the user exists.
+      const user = db.prepare("SELECT id FROM users WHERE id = ?").get(resetToken);
+      if (!user) {
+        return res.status(404).json({ error: "Token de recuperação inválido" });
+      }
+
+      const hashedPassword = hashPassword(newPassword);
+      db.prepare("UPDATE users SET password = ? WHERE id = ?").run(hashedPassword, resetToken);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao redefinir senha" });
+    }
+  });
+
+  app.get("/api/users/:id", authenticateUser, (req: any, res) => {
+    try {
+      const { id } = req.params;
+      
+      // Authorization check: User can only view their own profile unless they are admin
+      if (req.user.id !== id && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      const user = db.prepare("SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, referrals_count as referralsCount, cycle_sales_count as cycleSalesCount, balance, debt_balance as debtBalance, cashback_balance, snack_fast_cashback, energy_cashback, guincho_cashback, hability_test_cashback, mecanica_cashback, voucher_balance as voucherBalance, total_earnings as totalEarnings, document_status as documentStatus, stars, status, career_level as careerLevel, referral_code as referralCode, referrer_id as referrerId, reentry_mode as reentryMode, role, is_activated as isActivated FROM users WHERE id = ?").get(id);
+      
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+      res.json(user);
+    } catch (err) {
+      console.error("Error in /api/users/:id:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/me", authenticateUser, (req: any, res) => {
+    console.log(`[${new Date().toISOString()}] GET /api/me - Start`);
+    try {
+      const user = db.prepare("SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, referrals_count as referralsCount, cycle_sales_count as cycleSalesCount, balance, debt_balance as debtBalance, cashback_balance, snack_fast_cashback, energy_cashback, guincho_cashback, hability_test_cashback, mecanica_cashback, voucher_balance as voucherBalance, total_earnings as totalEarnings, document_status as documentStatus, stars, status, career_level as careerLevel, referral_code as referralCode, referrer_id as referrerId, reentry_mode as reentryMode, role, is_activated as isActivated FROM users WHERE id = ?").get(req.user.id);
+      
+      if (!user) {
+        return res.status(401).json({ error: "Não autenticado" });
+      }
+      console.log(`[${new Date().toISOString()}] GET /api/me - Success for user ${user.id}. Balance: ${user.balance}, Cashback: ${user.cashback_balance}, Snack: ${user.snack_fast_cashback}`);
+      res.json(user);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Error in /api/me:`, err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/init", authenticateUser, (req: any, res) => {
+    const timestamp = new Date().toISOString();
+    try {
+      const user = db.prepare("SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, referrals_count as referralsCount, cycle_sales_count as cycleSalesCount, balance, debt_balance as debtBalance, cashback_balance, snack_fast_cashback, energy_cashback, guincho_cashback, hability_test_cashback, mecanica_cashback, voucher_balance as voucherBalance, total_earnings as totalEarnings, document_status as documentStatus, stars, status, career_level as careerLevel, referral_code as referralCode, referrer_id as referrerId, reentry_mode as reentryMode, role, is_activated as isActivated FROM users WHERE id = ?").get(req.user.id) as any;
+      
+      if (!user) {
+        return res.status(401).json({ error: "Não autenticado" });
+      }
+
+      console.log(`[${timestamp}] GET /api/init - User found: ${user.name}`);
+
+      // Matrices
+      const isAdmin = isUserAdmin(user);
+      
+      let matricesWithPositions = [];
+      try {
+        let matrices;
+        if (isAdmin) {
+          // For admins, we fetch all open matrices but we'll join them directly to avoid parameter limits
+          matrices = db.prepare("SELECT * FROM matrices WHERE status = 'OPEN' AND type = 'ONBORD'").all();
+          
+          if (matrices.length > 0) {
+            const allPositions = db.prepare(`
+              SELECT mp.matrix_id, mp.position, mp.user_id as userId, u.name as name, u.nickname as nickname, u.referrals_count as referralsCount, u.status as status, u.career_level as careerLevel, u.balance as balance, u.cycle_sales_count as cycleSalesCount
+              FROM matrix_positions mp 
+              JOIN users u ON mp.user_id = u.id 
+              JOIN matrices m ON mp.matrix_id = m.id
+              WHERE m.status = 'OPEN' AND m.type = 'ONBORD'
+            `).all();
+
+            const positionsByMatrix = allPositions.reduce((acc: any, p: any) => {
+              if (!acc[p.matrix_id]) acc[p.matrix_id] = [];
+              acc[p.matrix_id].push({
+                ...p,
+                userName: p.name,
+                userNickname: p.nickname
+              });
+              return acc;
+            }, {});
+
+            matricesWithPositions = matrices.map((m: any) => ({
+              ...m,
+              positions: positionsByMatrix[m.id] || []
+            }));
+          }
+        } else {
+          // For regular users, they only see matrices they are in
+          matrices = db.prepare(`
+            SELECT DISTINCT m.* 
+            FROM matrices m 
+            JOIN matrix_positions mp ON m.id = mp.matrix_id 
+            WHERE m.status = 'OPEN' AND mp.user_id = ? AND m.type = 'ONBORD'
+          `).all(req.user.id);
+
+          if (matrices.length > 0) {
+            // Use a subquery to avoid passing many IDs as parameters
+            const allPositions = db.prepare(`
+              SELECT mp.matrix_id, mp.position, mp.user_id as userId, u.name as name, u.nickname as nickname, u.referrals_count as referralsCount, u.status as status, u.career_level as careerLevel, u.balance as balance, u.cycle_sales_count as cycleSalesCount
+              FROM matrix_positions mp 
+              JOIN users u ON mp.user_id = u.id 
+              WHERE mp.matrix_id IN (
+                SELECT matrix_id FROM matrix_positions WHERE user_id = ?
+              ) AND mp.matrix_id IN (SELECT id FROM matrices WHERE type = 'ONBORD')
+            `).all(req.user.id);
+
+            const positionsByMatrix = allPositions.reduce((acc: any, p: any) => {
+              if (!acc[p.matrix_id]) acc[p.matrix_id] = [];
+              acc[p.matrix_id].push({
+                ...p,
+                userName: p.name,
+                userNickname: p.nickname
+              });
+              return acc;
+            }, {});
+
+            matricesWithPositions = matrices.map((m: any) => ({
+              ...m,
+              positions: positionsByMatrix[m.id] || []
+            }));
+          }
+        }
+        console.log(`[${timestamp}] GET /api/init - Found ${matricesWithPositions.length} matrices with positions`);
+      } catch (matrixErr) {
+        console.error(`[${timestamp}] Error fetching matrices in /api/init:`, matrixErr);
+        // Continue without matrices if they fail, rather than crashing the whole init
+        matricesWithPositions = [];
+      }
+
+      // Notifications
+      const notifications = db.prepare("SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT 50").all(req.user.id);
+
+      // Transactions
+      const transactions = db.prepare("SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC").all(req.user.id);
+      const uniqueTransactions = Array.from(new Map(transactions.map((t: any) => [t.id, t])).values());
+
+      // Banner and Logo
+      const banner = db.prepare("SELECT value FROM settings WHERE key = 'banner_url'").get() as any;
+      const logo = db.prepare("SELECT value FROM settings WHERE key = 'logo_url'").get() as any;
+      const bannerUrl = banner?.value || 'https://images.unsplash.com/photo-1593941707882-a5bba14938c7?q=80&w=2070&auto=format&fit=crop';
+      const logoUrl = logo?.value || '';
+
+      // History
+      const history = db.prepare(`
+        SELECT DISTINCT m.* 
+        FROM matrices m 
+        JOIN matrix_positions mp ON m.id = mp.matrix_id 
+        WHERE m.status = 'CLOSED' AND mp.user_id = ?
+        ORDER BY m.id DESC
+      `).all(req.user.id);
+
+      // Documents
+      const documents = db.prepare("SELECT * FROM documents WHERE user_id = ?").all(req.user.id);
+
+      // Matrix Settings
+      const matrixSettings = {
+        adhesionFee: parseFloat(getSetting('matrix_adhesion_fee', '650')),
+        onboardBonus: parseFloat(getSetting('matrix_onboard_bonus', '100')),
+        cashboardBonus: parseFloat(getSetting('matrix_cashboard_bonus', '3990')),
+        referralBonus: parseFloat(getSetting('matrix_referral_bonus', '100')),
+        minReferralsToCycle: parseInt(getSetting('matrix_min_referrals_to_cycle', '2')),
+        flowEconomy: parseFloat(getSetting('flow_economy', '0')),
+        themeNeonGreen: getSetting('theme_neon_green', '#39ff14'),
+        themeNeonBlue: getSetting('theme_neon_blue', '#00f3ff'),
+        themeNeonPurple: getSetting('theme_neon_purple', '#bc13fe'),
+        themeNeonOrange: getSetting('theme_neon_orange', '#ff6700'),
+        themeNeonPink: getSetting('theme_neon_pink', '#ff00ff'),
+        // Service Visibility and Enabled Status
+        service_corridas_visible: getSetting('service_corridas_visible', 'true'),
+        service_corridas_enabled: getSetting('service_corridas_enabled', 'true'),
+        service_snack_visible: getSetting('service_snack_visible', 'true'),
+        service_snack_enabled: getSetting('service_snack_enabled', 'true'),
+        service_energy_visible: getSetting('service_energy_visible', 'true'),
+        service_energy_enabled: getSetting('service_energy_enabled', 'true'),
+        service_guincho_visible: getSetting('service_guincho_visible', 'true'),
+        service_guincho_enabled: getSetting('service_guincho_enabled', 'true'),
+        service_bonus_hability_test_visible: getSetting('service_bonus_hability_test_visible', 'true'),
+        service_bonus_hability_test_enabled: getSetting('service_bonus_hability_test_enabled', 'true'),
+        service_mecanica_visible: getSetting('service_mecanica_visible', 'true'),
+        service_mecanica_enabled: getSetting('service_mecanica_enabled', 'true'),
+        // Service Prices
+        service_guincho_urbano_price: getSetting('service_guincho_urbano_price', '180'),
+        service_guincho_interurbano_price: getSetting('service_guincho_interurbano_price', '450'),
+        service_assistencia_mensal_price: getSetting('service_assistencia_mensal_price', '85'),
+        service_corridas_curta_price: getSetting('service_corridas_curta_price', '15'),
+        service_corridas_media_price: getSetting('service_corridas_media_price', '35'),
+        service_corridas_longa_price: getSetting('service_corridas_longa_price', '75'),
+        service_snack_rapido_price: getSetting('service_snack_rapido_price', '25'),
+        service_snack_completa_price: getSetting('service_snack_completa_price', '55'),
+        service_snack_familia_price: getSetting('service_snack_familia_price', '120'),
+        service_energy_drink_price: getSetting('service_energy_drink_price', '12'),
+        service_energy_kit_price: getSetting('service_energy_kit_price', '150'),
+        service_energy_plano_price: getSetting('service_energy_plano_price', '290'),
+        service_bonus_hability_test_price_1: getSetting('service_bonus_hability_test_price_1', '100'),
+        service_bonus_hability_test_price_2: getSetting('service_bonus_hability_test_price_2', '250'),
+        service_bonus_hability_test_price_3: getSetting('service_bonus_hability_test_price_3', '500'),
+        service_mecanica_price_1: getSetting('service_mecanica_price_1', '50'),
+        service_mecanica_price_2: getSetting('service_mecanica_price_2', '150'),
+        service_mecanica_price_3: getSetting('service_mecanica_price_3', '300')
+      };
+
+      console.log(`[${timestamp}] GET /api/init - Success`);
+
+      res.json({
+        user,
+        matrices: matricesWithPositions,
+        notifications,
+        transactions: uniqueTransactions,
+        banner: { url: bannerUrl },
+        logo: { url: logoUrl },
+        history,
+        documents,
+        matrixSettings
+      });
+    } catch (err) {
+      console.error(`[${timestamp}] Error in /api/init:`, err);
+      res.status(500).json({ error: "Erro interno do servidor", details: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Helper functions moved to Managers and Utils
+
+  app.post("/api/auth/login", (req, res) => {
+    try {
+      const { email, password, firebaseUid } = req.body;
+      let user;
+      
+      if (firebaseUid) {
+        user = db.prepare("SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, referrals_count as referralsCount, balance, cashback_balance, snack_fast_cashback, energy_cashback, guincho_cashback, hability_test_cashback, mecanica_cashback, voucher_balance as voucherBalance, document_status as documentStatus, stars, status, career_level as careerLevel, referral_code as referralCode, referrer_id as referrerId, reentry_mode as reentryMode, role, is_activated as isActivated FROM users WHERE firebase_uid = ?").get(firebaseUid);
+      } else {
+        const hashedPassword = hashPassword(password);
+        user = db.prepare("SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, referrals_count as referralsCount, balance, cashback_balance, snack_fast_cashback, energy_cashback, guincho_cashback, hability_test_cashback, mecanica_cashback, voucher_balance as voucherBalance, document_status as documentStatus, stars, status, career_level as careerLevel, referral_code as referralCode, referrer_id as referrerId, reentry_mode as reentryMode, role, is_activated as isActivated FROM users WHERE email = ? AND (password = ? OR password = ?)").get(email, hashedPassword, password);
+        
+        // If logged in with plain text password, update it to hashed
+        if (user && password && db.prepare("SELECT password FROM users WHERE id = ?").get(user.id).password === password) {
+          db.prepare("UPDATE users SET password = ? WHERE id = ?").run(hashedPassword, user.id);
+        }
+      }
+      
+      if (!user) {
+        return res.status(401).json({ error: "Usuário não encontrado ou credenciais inválidas" });
+      }
+      res.json(user);
+    } catch (err) {
+      console.error("Error in /api/auth/login:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.post("/api/auth/register", (req, res) => {
+    try {
+      const { name, nickname, email, password, cpf, phone, birthDate, referrerId, referralCode, firebaseUid } = req.body;
+      
+      // Validate CPF
+      if (!validateCPF(cpf)) {
+        return res.status(400).json({ error: "CPF inválido. Por favor, insira um CPF verdadeiro." });
+      }
+
+      // Check if email already exists
+      const existingEmail = db.prepare("SELECT id FROM users WHERE email = ?").get(email);
+      if (existingEmail) {
+        return res.status(400).json({ error: "Este e-mail já está cadastrado." });
+      }
+
+      // Check if CPF already exists
+      const existingCPF = db.prepare("SELECT id FROM users WHERE cpf = ?").get(cpf);
+      if (existingCPF) {
+        return res.status(400).json({ error: "Este CPF já está cadastrado." });
+      }
+
+      // Check if Firebase UID already exists
+      if (firebaseUid) {
+        const existingFirebase = db.prepare("SELECT id FROM users WHERE firebase_uid = ?").get(firebaseUid);
+        if (existingFirebase) {
+          return res.status(400).json({ error: "Este usuário já possui um cadastro vinculado." });
+        }
+      }
+
+      let finalReferrerId = referrerId;
+      if (referralCode && !finalReferrerId) {
+        const referrer = db.prepare("SELECT id FROM users WHERE referral_code = ?").get(referralCode) as any;
+        if (referrer) {
+          finalReferrerId = referrer.id;
+        } else {
+          return res.status(400).json({ error: "Código de indicação inválido." });
+        }
+      }
+
+      const id = generateId("user");
+      const newReferralCode = generateReferralCode(name);
+      const hashedPassword = password ? hashPassword(password) : null;
+      
+      db.prepare("INSERT INTO users (id, firebase_uid, name, nickname, email, password, cpf, phone, birth_date, referrer_id, referral_code, is_activated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)").run(
+        id, firebaseUid || null, name, nickname, email, hashedPassword, cpf, phone, birthDate, finalReferrerId || null, newReferralCode
+      );
+
+      // Check for pending vouchers sent to this email or phone
+      const pendingVouchers = db.prepare("SELECT id, amount FROM vouchers WHERE (recipient_email = ? OR recipient_phone = ?) AND status = 'SENT'").all(email, phone) as any[];
+      for (const v of pendingVouchers) {
+        db.prepare("UPDATE vouchers SET owner_id = ?, recipient_id = ?, recipient_email = NULL, recipient_phone = NULL WHERE id = ?").run(id, id, v.id);
+        NotificationManager.createNotification(id, 'VOUCHER_RECEIVED', `Você recebeu um voucher de presente de R$ ${v.amount.toFixed(2)} que estava aguardando seu cadastro! 🎁`);
+      }
+
+      const user = db.prepare("SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, referrals_count as referralsCount, balance, cashback_balance, snack_fast_cashback, energy_cashback, guincho_cashback, hability_test_cashback, mecanica_cashback, voucher_balance as voucherBalance, document_status as documentStatus, stars, status, career_level as careerLevel, referral_code as referralCode, referrer_id as referrerId, reentry_mode as reentryMode, role, is_activated as isActivated FROM users WHERE id = ?").get(id);
+      res.json(user);
+    } catch (err) {
+      console.error("Error in /api/auth/register:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.post("/api/user/update", authenticateUser, (req: any, res) => {
+    try {
+      const { id, name, nickname, email, phone, pixKey, birthDate, avatar, reentryMode, bankName, bankAgency, bankAccount, bankAccountType } = req.body;
+      
+      // Authorization check: User can only update their own profile unless they are admin
+      if (req.user.id !== id && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      // Check if email already exists for another user
+      const existingEmail = db.prepare("SELECT id FROM users WHERE email = ? AND id != ?").get(email, id);
+      if (existingEmail) {
+        return res.status(400).json({ error: "Este e-mail já está sendo usado por outra conta." });
+      }
+
+      db.prepare(`
+        UPDATE users 
+        SET name = ?, nickname = ?, email = ?, phone = ?, pix_key = ?, birth_date = ?, avatar = ?, reentry_mode = ?,
+            bank_name = ?, bank_agency = ?, bank_account = ?, bank_account_type = ?
+        WHERE id = ?
+      `).run(
+        name, nickname, email, phone, pixKey, birthDate, avatar, reentryMode || 'AUTO',
+        bankName, bankAgency, bankAccount, bankAccountType, id
+      );
+      const user = db.prepare(`
+        SELECT id, name, nickname, email, cpf, phone, pix_key as pixKey, birth_date as birthDate, avatar, 
+               referrals_count as referralsCount, balance, cashback_balance, snack_fast_cashback, energy_cashback, voucher_balance as voucherBalance, 
+               document_status as documentStatus, stars, status, career_level as careerLevel, 
+               referral_code as referralCode, reentry_mode as reentryMode,
+               bank_name as bankName, bank_agency as bankAgency, bank_account as bankAccount, bank_account_type as bankAccountType,
+               is_activated as isActivated
+        FROM users 
+        WHERE id = ?
+      `).get(id);
+      res.json(user);
+    } catch (err) {
+      console.error("Error in /api/user/update:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.post("/api/user/activate", authenticateUser, (req: any, res) => {
+    try {
+      const { userId } = req.body;
+      if (req.user.id !== userId && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      const user = db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as any;
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+
+      if (user.is_activated) {
+        return res.status(400).json({ error: "Licença já está ativa" });
+      }
+
+      db.prepare("UPDATE users SET is_activated = 1 WHERE id = ?").run(userId);
+      
+      const adhesionFee = parseFloat(getSetting('matrix_adhesion_fee', '650'));
+      
+      // Record the transaction
+      db.prepare("INSERT INTO transactions (id, user_id, amount, type, description, status) VALUES (?, ?, ?, 'ADHESION', 'Ativação de Licença de Uso', 'COMPLETED')").run(
+        generateId("tx"), userId, adhesionFee
+      );
+
+      // Pay bonuses
+      if (user.referrer_id) {
+        FinancialManager.addReferralBonus(user.referrer_id, userId);
+        FinancialManager.payLicenseUnilevelBonus(userId);
+        FinancialManager.payInfiniteBonus(userId, adhesionFee);
+      }
+
+      // Add user to ONBORD matrix
+      const openMatrices = db.prepare("SELECT id FROM matrices WHERE type = 'ONBORD' AND status = 'OPEN' ORDER BY created_at ASC").all() as any[];
+      let targetMatrix = openMatrices.length > 0 ? openMatrices[0] : null;
+      if (!targetMatrix) {
+        targetMatrix = MatrixManager.createMatrix('ONBORD');
+      }
+      MatrixManager.fillPosition(targetMatrix.id, userId);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error in /api/user/activate:", err);
+      res.status(500).json({ error: "Erro ao ativar licença" });
+    }
+  });
+
+  app.get("/api/transactions", authenticateUser, (req: any, res) => {
+    console.log(`[${new Date().toISOString()}] GET /api/transactions - Start`);
+    try {
+      console.log(`[${new Date().toISOString()}] GET /api/transactions - Fetching for user ${req.user.id}`);
+      const transactions = db.prepare("SELECT id, amount, type, description, status, created_at as createdAt FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(req.user.id);
+      
+      // Ensure unique transactions by ID
+      const uniqueTransactions = Array.from(new Map(transactions.map((t: any) => [t.id, t]) as any).values());
+      
+      console.log(`[${new Date().toISOString()}] GET /api/transactions - Found ${uniqueTransactions.length} unique transactions`);
+      res.json(uniqueTransactions);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Error in /api/transactions:`, err);
+      res.status(500).json({ error: "Erro interno do servidor", details: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get("/api/documents", authenticateUser, (req: any, res) => {
+    try {
+      const documents = db.prepare("SELECT id, user_id as userId, filename, type, status, rejection_reason as rejectionReason, amount, created_at as createdAt FROM documents WHERE user_id = ? ORDER BY created_at DESC").all(req.user.id);
+      res.json(documents);
+    } catch (err) {
+      console.error("Error in /api/documents:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.post("/api/documents/upload", authenticateUser, async (req: any, res) => {
+    try {
+      const { userId, filename, content, type } = req.body;
+      if (!userId || !content || !type) return res.status(400).json({ error: "Dados incompletos" });
+
+      // Authorization check: User can only upload for themselves unless they are admin
+      if (req.user.id !== userId && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      const user = db.prepare("SELECT referrals_count FROM users WHERE id = ?").get(userId) as any;
+      if (!user) return res.status(404).json({ error: "Usuário não encontrado" });
+
+      let status = 'PENDING';
+      let rejectionReason = null;
+      let amount = null;
+
+      if (type === 'NFSE') {
+        // Validation logic (mirrored from fiscalService.ts)
+        try {
+          const result = await parseStringPromise(content);
+          const nfseRoot = 
+            result?.CompNfse?.Nfse?.[0]?.InfNfse?.[0] || 
+            result?.Nfse?.InfNfse?.[0] || 
+            result?.Nfse?.InfNfse ||
+            result?.ConsultarNfseResposta?.ListaNfse?.[0]?.CompNfse?.[0]?.Nfse?.[0]?.InfNfse?.[0] ||
+            result?.NFe?.infNFe?.[0] || 
+            result?.NFe?.infNFe;
+
+          if (!nfseRoot) {
+            return res.status(400).json({ error: "Estrutura XML inválida ou NFS-e não encontrada." });
+          }
+
+          const tomadorCnpj = 
+            nfseRoot?.TomadorServico?.[0]?.IdentificacaoTomador?.[0]?.CpfCnpj?.[0]?.Cnpj?.[0] ||
+            nfseRoot?.Tomador?.[0]?.CpfCnpj?.[0]?.CNPJ?.[0] ||
+            nfseRoot?.dest?.[0]?.CNPJ?.[0] ||
+            '';
+
+          const grossAmountStr = 
+            nfseRoot?.Servico?.[0]?.Valores?.[0]?.ValorServicos?.[0] ||
+            nfseRoot?.total?.[0]?.ICMSTot?.[0]?.vNF?.[0] ||
+            '0';
+          
+          amount = parseFloat(grossAmountStr.replace(',', '.'));
+          const cleanSeseCnpj = SESE_CNPJ.replace(/[^\d]/g, '');
+          const cleanTomadorCnpj = tomadorCnpj.replace(/[^\d]/g, '');
+
+          if (cleanTomadorCnpj !== cleanSeseCnpj) {
+            status = 'REJECTED';
+            rejectionReason = `CNPJ do tomador (${tomadorCnpj || 'não encontrado'}) não corresponde ao da MOBICYCLE.`;
+          } else {
+            const requiredAmount = user.referrals_count >= 1 ? (parseFloat(getSetting('matrix_cashboard_bonus', '3990')) / 2) : parseFloat(getSetting('matrix_cashboard_bonus', '3990'));
+            if (amount < requiredAmount) {
+              status = 'REJECTED';
+              rejectionReason = `Valor bruto (R$ ${amount.toFixed(2)}) insuficiente. Mínimo necessário: R$ ${requiredAmount.toFixed(2)}`;
+            } else {
+              status = 'APPROVED';
+            }
+          }
+        } catch (xmlErr) {
+          return res.status(400).json({ error: "Erro ao processar arquivo XML." });
+        }
+      } else if (type === 'ADDRESS_PROOF_LUZ' || type === 'ADDRESS_PROOF_PHONE') {
+        // Address proofs are manually reviewed
+        status = 'PENDING';
+      } else {
+        return res.status(400).json({ error: "Tipo de documento inválido." });
+      }
+
+      const docId = generateId("doc");
+      db.prepare("INSERT INTO documents (id, user_id, filename, content, type, status, rejection_reason, amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(
+        docId, userId, filename, content, type, status, rejectionReason, amount
+      );
+
+      // Update user document status if approved (only for NFSE for now, or maybe any approval)
+      if (status === 'APPROVED') {
+        db.prepare("UPDATE users SET document_status = 'VALIDATED' WHERE id = ?").run(userId);
+      } else if (status === 'REJECTED') {
+        db.prepare("UPDATE users SET document_status = 'REJECTED' WHERE id = ?").run(userId);
+      }
+
+      res.json({ 
+        id: docId, 
+        status, 
+        rejectionReason, 
+        amount,
+        message: status === 'APPROVED' ? 'Documento validado com sucesso!' : 
+                 status === 'PENDING' ? 'Documento enviado para análise manual.' : 
+                 'Documento rejeitado.'
+      });
+    } catch (err) {
+      console.error("Error in /api/documents/upload:", err);
+      res.status(500).json({ error: "Erro ao processar documento" });
+    }
+  });
+
+  app.get("/api/admin/documents", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const documents = db.prepare(`
+        SELECT d.id, d.user_id as userId, d.filename, d.type, d.status, d.rejection_reason as rejectionReason, d.amount, d.created_at as createdAt, u.name as userName, u.email as userEmail
+        FROM documents d
+        JOIN users u ON d.user_id = u.id
+        ORDER BY d.created_at DESC
+      `).all();
+      res.json(documents);
+    } catch (err) {
+      console.error("Error in /api/admin/documents:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/user/referrals", authenticateUser, (req: any, res) => {
+    try {
+      const referrals = db.prepare(`
+        SELECT id, name, nickname, email, status, avatar, created_at as createdAt 
+        FROM users 
+        WHERE referrer_id = ? 
+        ORDER BY created_at DESC
+      `).all(req.user.id);
+      
+      // Ensure unique referrals
+      const uniqueReferrals = Array.from(new Map(referrals.map((r: any) => [r.id, r]) as any).values());
+      res.json(uniqueReferrals);
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno ao buscar indicados" });
+    }
+  });
+
+  app.get("/api/settings/all", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const settings = db.prepare("SELECT * FROM settings").all();
+      const settingsMap = settings.reduce((acc: any, curr: any) => {
+        acc[curr.key] = curr.value;
+        return acc;
+      }, {});
+      res.json(settingsMap);
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.post("/api/settings/update", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { settings } = req.body;
+
+      const updateStmt = db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)");
+      const transaction = db.transaction((settingsToUpdate) => {
+        for (const [key, value] of Object.entries(settingsToUpdate)) {
+          updateStmt.run(key, String(value));
+        }
+      });
+
+      transaction(settings);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.get("/api/settings/banner", (req, res) => {
+    try {
+      const banner = db.prepare("SELECT value FROM settings WHERE key = 'banner_url'").get() as any;
+      res.json({ url: banner?.value || 'https://images.unsplash.com/photo-1593941707882-a5bba14938c7?q=80&w=2070&auto=format&fit=crop' });
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.get("/api/settings/logo", (req, res) => {
+    try {
+      const logo = db.prepare("SELECT value FROM settings WHERE key = 'logo_url'").get() as any;
+      res.json({ url: logo?.value || '' });
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.post("/api/settings/banner", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { url } = req.body;
+      db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('banner_url', ?)").run(url);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.get("/api/notifications", authenticateUser, (req: any, res) => {
+    try {
+      const notifications = db.prepare("SELECT id, type, message, is_read as isRead, created_at as createdAt FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(req.user.id);
+      res.json(notifications);
+    } catch (err) {
+      console.error("Error in /api/notifications:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.post("/api/notifications/:id/read", authenticateUser, (req: any, res) => {
+    try {
+      const { id } = req.params;
+      // Security check: Ensure notification belongs to user
+      const notification = db.prepare("SELECT user_id FROM notifications WHERE id = ?").get(id) as any;
+      if (!notification || (notification.user_id !== req.user.id && !isUserAdmin(req.user))) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      db.prepare("UPDATE notifications SET is_read = 1 WHERE id = ?").run(id);
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error in /api/notifications/read:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/push/vapid-public-key", (req, res) => {
+    try {
+      const publicKey = NotificationManager.getPublicKey();
+      res.json({ publicKey });
+    } catch (err) {
+      console.error("Error fetching VAPID public key:", err);
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.post("/api/push/subscribe", authenticateUser, (req: any, res) => {
+    try {
+      const { subscription, userId } = req.body;
+      if (!userId || !subscription) {
+        return res.status(400).json({ error: "Dados incompletos" });
+      }
+
+      // Authorization check
+      if (req.user.id !== userId && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      db.prepare("INSERT OR REPLACE INTO push_subscriptions (user_id, subscription) VALUES (?, ?)").run(
+        userId, JSON.stringify(subscription)
+      );
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error in /api/push/subscribe:", err);
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  // Helper functions moved to Managers and Utils
+
+  app.get("/api/matrices/history", authenticateUser, (req: any, res) => {
+    try {
+      const history = db.prepare("SELECT * FROM matrix_cycles WHERE user_id = ? ORDER BY created_at DESC").all(req.user.id);
+      // Ensure unique history entries
+      const uniqueHistory = Array.from(new Map(history.map((h: any) => [h.id, h]) as any).values());
+      res.json(uniqueHistory);
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.get("/api/affiliates/leaderboard", (req, res) => {
+    try {
+      const topUsers = db.prepare(`
+        SELECT id, name, nickname, avatar, referrals_count, status, career_level 
+        FROM users 
+        WHERE referrals_count > 0 
+        ORDER BY referrals_count DESC 
+        LIMIT 10
+      `).all();
+      res.json(topUsers);
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao buscar ranking" });
+    }
+  });
+
+  app.get("/api/matrices", authenticateUser, (req: any, res) => {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] GET /api/matrices - Start`);
+    try {
+      const isAdmin = isUserAdmin(req.user);
+      const type = req.query.type as string;
+
+      let matricesWithPositions = [];
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = parseInt(req.query.limit as string) || 10;
+      const offset = (page - 1) * limit;
+      
+      if (isAdmin) {
+        let query = "SELECT * FROM matrices WHERE status = 'OPEN'";
+        let params: any[] = [];
+        if (type) {
+          query += " AND type = ?";
+          params.push(type);
+        }
+        query += " ORDER BY created_at DESC LIMIT ? OFFSET ?";
+        params.push(limit, offset);
+        
+        const matrices = db.prepare(query).all(...params);
+        if (matrices.length > 0) {
+          const matrixIds = matrices.map((m: any) => m.id);
+          const placeholders = matrixIds.map(() => '?').join(',');
+          const allPositions = db.prepare(`
+            SELECT mp.matrix_id, mp.position, mp.user_id as userId, u.name as name, u.nickname as nickname, u.referrals_count as referralsCount, u.status as status, u.career_level as careerLevel, u.balance as balance, u.cycle_sales_count as cycleSalesCount
+            FROM matrix_positions mp 
+            JOIN users u ON mp.user_id = u.id 
+            WHERE mp.matrix_id IN (${placeholders})
+          `).all(...matrixIds);
+
+          const positionsByMatrix = allPositions.reduce((acc: any, p: any) => {
+            if (!acc[p.matrix_id]) acc[p.matrix_id] = [];
+            acc[p.matrix_id].push({
+              ...p,
+              userName: p.name,
+              userNickname: p.nickname
+            });
+            return acc;
+          }, {});
+
+          matricesWithPositions = matrices.map((m: any) => ({
+            ...m,
+            positions: positionsByMatrix[m.id] || []
+          }));
+        }
+      } else {
+        let query = `
+          SELECT DISTINCT m.* 
+          FROM matrices m 
+          JOIN matrix_positions mp ON m.id = mp.matrix_id 
+          WHERE m.status = 'OPEN' AND mp.user_id = ?
+        `;
+        let params: any[] = [req.user.id];
+        if (type) {
+          query += " AND m.type = ?";
+          params.push(type);
+        }
+        
+        const matrices = db.prepare(query).all(...params);
+
+        if (matrices.length > 0) {
+          const allPositions = db.prepare(`
+            SELECT mp.matrix_id, mp.position, mp.user_id as userId, u.name as name, u.nickname as nickname, u.referrals_count as referralsCount, u.status as status, u.career_level as careerLevel, u.balance as balance, u.cycle_sales_count as cycleSalesCount
+            FROM matrix_positions mp 
+            JOIN users u ON mp.user_id = u.id 
+            WHERE mp.matrix_id IN (
+              SELECT matrix_id FROM matrix_positions WHERE user_id = ?
+            )
+          `).all(req.user.id);
+
+          const positionsByMatrix = allPositions.reduce((acc: any, p: any) => {
+            if (!acc[p.matrix_id]) acc[p.matrix_id] = [];
+            acc[p.matrix_id].push({
+              ...p,
+              userName: p.name,
+              userNickname: p.nickname
+            });
+            return acc;
+          }, {});
+
+          matricesWithPositions = matrices.map((m: any) => ({
+            ...m,
+            positions: positionsByMatrix[m.id] || []
+          }));
+        }
+      }
+      
+      console.log(`[${timestamp}] GET /api/matrices - Found ${matricesWithPositions.length} matrices`);
+      res.json(matricesWithPositions);
+    } catch (err) {
+      console.error(`[${timestamp}] Error in /api/matrices:`, err);
+      res.status(500).json({ 
+        error: "Erro ao buscar matrizes", 
+        details: err instanceof Error ? err.message : String(err) 
+      });
+    }
+  });
+
+  // Helper functions moved to Managers and Utils
+
+  app.post("/api/matrices/join", authenticateUser, (req: any, res) => {
+    try {
+      const { userId, referrerId } = req.body;
+
+      // Authorization check
+      if (req.user.id !== userId && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      // Rule: Only one active position allowed in the entire system
+      const activePosition = db.prepare("SELECT mp.matrix_id FROM matrix_positions mp JOIN matrices m ON mp.matrix_id = m.id WHERE mp.user_id = ? AND m.status = 'OPEN'").get(userId);
+      if (activePosition) {
+        return res.status(400).json({ error: "Você já possui uma posição ativa no sistema (On-Board ou Cash-Board). Aguarde o ciclo para reentrar." });
+      }
+
+      // Matrix formation logic
+      const formationRule = getSetting('matrix_formation_rule', 'FILL_BASE');
+      let matrix = null;
+
+      if (formationRule === 'FOLLOW_REFERRER') {
+        if (referrerId) {
+          const referrerMatrix = db.prepare(`
+            SELECT m.id 
+            FROM matrices m 
+            JOIN matrix_positions mp ON m.id = mp.matrix_id 
+            WHERE mp.user_id = ? AND m.type = 'ONBORD' AND m.status = 'OPEN'
+            LIMIT 1
+          `).get(referrerId);
+          if (referrerMatrix) matrix = referrerMatrix;
+        }
+      }
+
+      if (!matrix) {
+        const openMatrices = db.prepare("SELECT id FROM matrices WHERE type = 'ONBORD' AND status = 'OPEN' ORDER BY created_at ASC").all();
+        matrix = openMatrices.length > 0 ? openMatrices[0] : null;
+      }
+
+      if (!matrix) {
+        matrix = MatrixManager.createMatrix('ONBORD');
+      }
+      const existing = db.prepare("SELECT * FROM matrix_positions WHERE matrix_id = ? AND user_id = ?").get(matrix.id, userId);
+      if (existing) return res.status(400).json({ error: "Usuário já está nesta matriz" });
+
+      // Handle referral
+      if (referrerId && referrerId !== userId) {
+        FinancialManager.addReferralBonus(referrerId, userId);
+        const adhesionFee = parseFloat(getSetting('matrix_adhesion_fee', '650'));
+        // Pay infinite bonus on the sale
+        FinancialManager.payInfiniteBonus(userId, adhesionFee);
+        // Pay 8-level unilevel bonus on the sale
+        FinancialManager.payLicenseUnilevelBonus(userId);
+      }
+
+      const result = MatrixManager.fillPosition(matrix.id, userId);
+      if (result.error) return res.status(400).json(result);
+
+      // Increment network sales for ancestors
+      FinancialManager.incrementNetworkSales(userId);
+
+      // Update user status to BRONZE upon joining first matrix
+      db.prepare("UPDATE users SET status = 'BRONZE' WHERE id = ? AND status = 'PARTNER'").run(userId);
+
+      res.json({ success: true, cycleInfo: result.cycleInfo });
+    } catch (err) {
+      console.error("Error in /api/matrices/join:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/admin/matrices/summary", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const matrices = db.prepare(`
+        SELECT m.id, m.type, m.status, m.created_at as createdAt,
+               (SELECT COUNT(*) FROM matrix_positions WHERE matrix_id = m.id) as filledPositions
+        FROM matrices m
+        WHERE m.status = 'OPEN'
+        ORDER BY m.created_at DESC
+      `).all();
+
+      res.json(matrices);
+    } catch (err) {
+      console.error("Error in /api/admin/matrices/summary:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.post("/api/admin/fill-matrix", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { matrixId, userId, referrerId } = req.body;
+      
+      // Ensure user exists
+      const user = db.prepare("SELECT id FROM users WHERE id = ?").get(userId);
+      if (!user) {
+        db.prepare("INSERT INTO users (id, name, email, cpf) VALUES (?, ?, ?, ?)").run(
+          userId, `Convidado ${userId}`, `${userId}@example.com`, `CPF-${userId}`
+        );
+      }
+
+      // Handle referral
+      if (referrerId && referrerId !== userId) {
+        FinancialManager.addReferralBonus(referrerId, userId);
+        const adhesionFee = parseFloat(getSetting('matrix_adhesion_fee', '650'));
+        // Pay infinite bonus on the sale
+        FinancialManager.payInfiniteBonus(userId, adhesionFee);
+        // Pay 8-level unilevel bonus on the sale
+        FinancialManager.payLicenseUnilevelBonus(userId);
+      }
+
+      // Rule: Only one active position allowed in the entire system
+      const activePosition = db.prepare("SELECT mp.matrix_id FROM matrix_positions mp JOIN matrices m ON mp.matrix_id = m.id WHERE mp.user_id = ? AND m.status = 'OPEN'").get(userId);
+      if (activePosition) {
+        return res.status(400).json({ error: "Este usuário já possui uma posição ativa no sistema." });
+      }
+
+      const result = MatrixManager.fillPosition(matrixId, userId);
+      if (result.error) return res.status(400).json(result);
+
+      // Update user status to BRONZE upon joining first matrix
+      db.prepare("UPDATE users SET status = 'BRONZE' WHERE id = ? AND status = 'PARTNER'").run(userId);
+
+      res.json({ success: true, cycleInfo: result.cycleInfo });
+    } catch (err) {
+      console.error("Error in /api/admin/fill-matrix:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+
+  app.post("/api/matrices/reentry", authenticateUser, (req: any, res) => {
+    try {
+      const { userId } = req.body;
+
+      // Authorization check
+      if (req.user.id !== userId && !isUserAdmin(req.user)) {
+        return res.status(403).json({ error: "Acesso negado" });
+      }
+
+      const result = MatrixManager.processReentryInternal(userId);
+      if (result.error) return res.status(400).json(result);
+      res.json({ success: true, cycleInfo: result.cycleInfo });
+    } catch (err) {
+      console.error("Error in /api/matrices/reentry:", err);
+      res.status(500).json({ error: "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/admin/matrix/:id/details", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { id } = req.params;
+      const matrix = db.prepare("SELECT * FROM matrices WHERE id = ?").get(id) as any;
+      if (!matrix) return res.status(404).json({ error: "Matriz não encontrada" });
+
+      const positions = db.prepare(`
+        SELECT mp.position, u.id as userId, u.name, u.nickname, u.email, u.status, u.career_level as careerLevel, u.referrals_count as referralsCount
+        FROM matrix_positions mp
+        JOIN users u ON mp.user_id = u.id
+        WHERE mp.matrix_id = ?
+        ORDER BY mp.position ASC
+      `).all(id);
+
+      const history = db.prepare(`
+        SELECT mh.*, u.name as userName
+        FROM matrix_history mh
+        JOIN users u ON mh.user_id = u.id
+        WHERE mh.matrix_id = ?
+        ORDER BY mh.created_at DESC
+        LIMIT 50
+      `).all(id);
+
+      const cycles = db.prepare(`
+        SELECT mc.*, u.name as userName
+        FROM matrix_cycles mc
+        JOIN users u ON mc.user_id = u.id
+        WHERE mc.matrix_id = ?
+        ORDER BY mc.created_at DESC
+        LIMIT 50
+      `).all(id);
+
+      res.json({
+        ...matrix,
+        positions,
+        history,
+        cycles
+      });
+    } catch (err) {
+      console.error("Error in /api/admin/matrix/:id/details:", err);
+      res.status(500).json({ error: "Erro ao buscar detalhes da matriz" });
+    }
+  });
+
+  app.get("/api/vouchers", authenticateUser, (req: any, res) => {
+    try {
+      const vouchers = db.prepare("SELECT id, code, amount, owner_id as ownerId, recipient_id as recipientId, recipient_email as recipientEmail, recipient_phone as recipientPhone, status, created_at as createdAt FROM vouchers WHERE owner_id = ? OR recipient_id = ? ORDER BY created_at DESC").all(req.user.id, req.user.id);
+      res.json(vouchers);
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao buscar vouchers" });
+    }
+  });
+
+  app.post("/api/services/use-cashback", authenticateUser, (req: any, res) => {
+    try {
+      const { amount, serviceName } = req.body;
+      if (!amount || amount <= 0) return res.status(400).json({ error: "Valor inválido" });
+      if (!serviceName) return res.status(400).json({ error: "Nome do serviço é obrigatório" });
+
+      // Map service names to their respective cashback columns
+      const balanceMap: Record<string, string> = {
+        'Corridas': 'cashback_balance',
+        'Snack': 'snack_fast_cashback',
+        'Energy': 'energy_cashback',
+        'Mecânica': 'mecanica_cashback',
+        'Bônus Guincho': 'guincho_cashback'
+      };
+
+      const balanceColumn = balanceMap[serviceName] || 'cashback_balance';
+
+      const user = db.prepare(`SELECT ${balanceColumn} as balance FROM users WHERE id = ?`).get(req.user.id) as any;
+      if (!user || user.balance < amount) {
+        return res.status(400).json({ error: `Saldo de cashback ${serviceName} insuficiente` });
+      }
+
+      db.transaction(() => {
+        db.prepare(`UPDATE users SET ${balanceColumn} = ${balanceColumn} - ? WHERE id = ?`).run(amount, req.user.id);
+        db.prepare("INSERT INTO transactions (id, user_id, amount, type, description, status) VALUES (?, ?, ?, 'WITHDRAWAL', ?, 'COMPLETED')").run(
+          generateId('tx'), req.user.id, -amount, `Uso de Cashback: ${serviceName}`
+        );
+        
+        // Trigger Unilevel Bonus on Cashback Usage (up to 8 levels, min 1 direct referral)
+        FinancialManager.payCashbackUsageUnilevelBonus(req.user.id, amount, serviceName);
+      })();
+
+      res.json({ success: true, message: `Serviço ${serviceName} pago com sucesso!` });
+    } catch (err) {
+      console.error("Error in /api/services/use-cashback:", err);
+      res.status(500).json({ error: "Erro ao processar uso de cashback" });
+    }
+  });
+
+  app.post("/api/financial/withdraw", authenticateUser, (req: any, res) => {
+    try {
+      const { amount, pixKey } = req.body;
+      const userId = req.user.id;
+
+      if (!amount || amount <= 0) {
+        return res.status(400).json({ error: "Valor de saque inválido" });
+      }
+
+      if (!pixKey) {
+        return res.status(400).json({ error: "Chave PIX é obrigatória" });
+      }
+
+      const updatedUser = FinancialManager.requestWithdrawal(userId, amount, pixKey);
+      res.json({ success: true, user: updatedUser });
+    } catch (err) {
+      console.error("Error in /api/financial/withdraw:", err);
+      res.status(400).json({ error: err instanceof Error ? err.message : "Erro ao processar saque" });
+    }
+  });
+
+  app.post("/api/financial/deposit", authenticateUser, (req: any, res) => {
+    try {
+      const { amount } = req.body;
+      const userId = req.user.id;
+
+      if (!amount || amount <= 0) {
+        return res.status(400).json({ error: "Valor de depósito inválido" });
+      }
+
+      const updatedUser = FinancialManager.processDeposit(userId, amount);
+      res.json({ success: true, user: updatedUser });
+    } catch (err) {
+      console.error("Error in /api/financial/deposit:", err);
+      res.status(400).json({ error: err instanceof Error ? err.message : "Erro ao processar depósito" });
+    }
+  });
+
+  app.post("/api/vouchers/purchase", authenticateUser, (req: any, res) => {
+    try {
+      const { amount } = req.body;
+      if (!amount || amount <= 0) return res.status(400).json({ error: "Valor inválido" });
+
+      const user = db.prepare("SELECT cashback_balance FROM users WHERE id = ?").get(req.user.id) as any;
+      if (!user || user.cashback_balance < amount) {
+        return res.status(400).json({ error: "Saldo de cashback insuficiente" });
+      }
+
+      const voucherId = generateId('vch');
+      const voucherCode = generateId('code').toUpperCase();
+
+      db.transaction(() => {
+        db.prepare("UPDATE users SET cashback_balance = cashback_balance - ? WHERE id = ?").run(amount, req.user.id);
+        db.prepare("INSERT INTO vouchers (id, code, amount, owner_id, status) VALUES (?, ?, ?, ?, 'AVAILABLE')").run(
+          voucherId, voucherCode, amount, req.user.id
+        );
+        db.prepare("INSERT INTO transactions (id, user_id, amount, type, description, status) VALUES (?, ?, ?, 'WITHDRAWAL', ?, 'COMPLETED')").run(
+          generateId('tx'), req.user.id, -amount, `Compra de Voucher: ${voucherCode}`
+        );
+      })();
+
+      res.json({ success: true, voucher: { id: voucherId, code: voucherCode, amount } });
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao adquirir voucher" });
+    }
+  });
+
+  app.post("/api/vouchers/send", authenticateUser, async (req: any, res) => {
+    try {
+      const { voucherId, recipientId, recipientEmail, recipientPhone } = req.body;
+      if (!voucherId || (!recipientId && !recipientEmail && !recipientPhone)) return res.status(400).json({ error: "Dados incompletos" });
+
+      const sender = db.prepare("SELECT name, referral_code FROM users WHERE id = ?").get(req.user.id) as any;
+      if (!sender) return res.status(404).json({ error: "Remetente não encontrado" });
+
+      const voucher = db.prepare("SELECT * FROM vouchers WHERE id = ? AND owner_id = ? AND (status = 'AVAILABLE' OR status = 'SENT')").get(voucherId, req.user.id) as any;
+      if (!voucher) {
+        return res.status(400).json({ error: "Voucher não disponível ou não pertence a você" });
+      }
+
+      const appUrl = process.env.APP_URL || 'https://wayfy.com';
+      const registrationLink = `${appUrl}/?ref=${sender.referral_code}`;
+      const ruleMessage = "Regra: Somente cadastrados diretos podem usar este voucher em corridas no app de mobilidade.";
+
+      if (recipientId) {
+        // Check if recipient is a direct referral
+        const recipient = db.prepare("SELECT id, name FROM users WHERE id = ? AND referrer_id = ?").get(recipientId, req.user.id) as any;
+        if (!recipient) {
+          return res.status(400).json({ error: "O destinatário deve ser um indicado direto na sua rede para poder usar o voucher." });
+        }
+
+        db.transaction(() => {
+          db.prepare("UPDATE vouchers SET owner_id = ?, recipient_id = ?, status = 'SENT' WHERE id = ?").run(recipientId, recipientId, voucherId);
+          
+          const message = `Você recebeu um voucher de R$ ${voucher.amount.toFixed(2)} de ${sender.name}! 🎁\n\n` +
+                          `${ruleMessage}\n\n` +
+                          `Seu link de cadastro do indicador: ${registrationLink}`;
+          
+          NotificationManager.createNotification(recipientId, 'VOUCHER_RECEIVED', message);
+        })();
+      } else if (recipientEmail) {
+        // Check if user already exists with this email
+        const existingUser = db.prepare("SELECT id, referrer_id FROM users WHERE email = ?").get(recipientEmail) as any;
+        
+        if (existingUser) {
+          if (existingUser.referrer_id !== req.user.id) {
+            return res.status(400).json({ error: "Este usuário já está cadastrado sob outro indicador." });
+          }
+          
+          // If already a direct referral, just send it
+          db.transaction(() => {
+            db.prepare("UPDATE vouchers SET owner_id = ?, recipient_id = ?, status = 'SENT' WHERE id = ?").run(existingUser.id, existingUser.id, voucherId);
+            const message = `Você recebeu um voucher de R$ ${voucher.amount.toFixed(2)} de ${sender.name}! 🎁\n\n` +
+                            `${ruleMessage}\n\n` +
+                            `Seu link de cadastro do indicador: ${registrationLink}`;
+            NotificationManager.createNotification(existingUser.id, 'VOUCHER_RECEIVED', message);
+          })();
+        } else {
+          // New friend, send email with link
+          db.transaction(() => {
+            db.prepare("UPDATE vouchers SET status = 'SENT', recipient_email = ? WHERE id = ?").run(recipientEmail, voucherId);
+          })();
+
+          // Send email
+          const emailSubject = `🎁 Você recebeu um presente de ${sender.name}!`;
+          const emailBody = `
+            Olá!
+            
+            ${sender.name} enviou um voucher de presente no valor de R$ ${voucher.amount.toFixed(2)} para você usar no app de mobilidade MOBICYCLE!
+            
+            Para resgatar seu presente, você precisa se cadastrar como um indicado direto de ${sender.name} usando o link abaixo:
+            
+            ${registrationLink}
+            
+            ${ruleMessage}
+            
+            Após o cadastro, seu voucher estará disponível na sua conta.
+            
+            Equipe MOBICYCLE
+          `;
+          await sendNotificationEmail(recipientEmail, emailSubject, emailBody);
+        }
+      } else if (recipientPhone) {
+        // Check if user already exists with this phone
+        const existingUser = db.prepare("SELECT id, referrer_id FROM users WHERE phone = ?").get(recipientPhone) as any;
+        
+        if (existingUser) {
+          if (existingUser.referrer_id !== req.user.id) {
+            return res.status(400).json({ error: "Este usuário já está cadastrado sob outro indicador." });
+          }
+          
+          db.transaction(() => {
+            db.prepare("UPDATE vouchers SET owner_id = ?, recipient_id = ?, status = 'SENT' WHERE id = ?").run(existingUser.id, existingUser.id, voucherId);
+            const message = `Você recebeu um voucher de R$ ${voucher.amount.toFixed(2)} de ${sender.name}! 🎁\n\n` +
+                            `${ruleMessage}\n\n` +
+                            `Seu link de cadastro do indicador: ${registrationLink}`;
+            NotificationManager.createNotification(existingUser.id, 'VOUCHER_RECEIVED', message);
+          })();
+        } else {
+          // New friend, mark as sent by phone
+          db.transaction(() => {
+            db.prepare("UPDATE vouchers SET status = 'SENT', recipient_phone = ? WHERE id = ?").run(recipientPhone, voucherId);
+          })();
+        }
+
+        // Generate WhatsApp message
+        const waMessage = `Olá! 🎁\n\n` +
+                          `${sender.name} enviou um voucher de presente no valor de R$ ${voucher.amount.toFixed(2)} para você usar no app de mobilidade MOBICYCLE!\n\n` +
+                          `Para resgatar seu presente, você precisa se cadastrar como um indicado direto de ${sender.name} usando o link abaixo:\n\n` +
+                          `${registrationLink}\n\n` +
+                          `${ruleMessage}\n\n` +
+                          `Após o cadastro, seu voucher estará disponível na sua conta.`;
+        
+        const waUrl = `https://wa.me/${recipientPhone.replace(/\D/g, '')}?text=${encodeURIComponent(waMessage)}`;
+        return res.json({ success: true, whatsappUrl: waUrl });
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error in /api/vouchers/send:", err);
+      res.status(500).json({ error: "Erro ao enviar voucher" });
+    }
+  });
+
+  app.get("/api/rankings", authenticateUser, (req, res) => {
+    try {
+      const topReferrers = db.prepare(`
+        SELECT id, name, nickname, avatar, referrals_count as referralsCount 
+        FROM users 
+        WHERE referrals_count > 0 
+        ORDER BY referrals_count DESC 
+        LIMIT 10
+      `).all();
+
+      const topCyclers = db.prepare(`
+        SELECT u.id, u.name, u.nickname, u.avatar, COUNT(mc.id) as cycleCount 
+        FROM users u
+        JOIN matrix_cycles mc ON u.id = mc.user_id
+        GROUP BY u.id
+        ORDER BY cycleCount DESC
+        LIMIT 10
+      `).all();
+
+      res.json({ topReferrers, topCyclers });
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao buscar rankings" });
+    }
+  });
+
+  app.get("/api/user/achievements", authenticateUser, (req: any, res) => {
+    try {
+      const badges = db.prepare("SELECT * FROM badges WHERE user_id = ?").all(req.user.id);
+      res.json(badges);
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao buscar conquistas" });
+    }
+  });
+
+  app.get("/api/user/progress", authenticateUser, (req: any, res) => {
+    try {
+      const user = db.prepare("SELECT referrals_count, career_level, cycle_sales_count FROM users WHERE id = ?").get(req.user.id) as any;
+      const cycleCount = db.prepare("SELECT COUNT(*) as count FROM matrix_cycles WHERE user_id = ?").get(req.user.id) as any;
+      
+      const milestones = [
+        { count: 2, level: 'BRONZE' },
+        { count: 5, level: 'SILVER' },
+        { count: 10, level: 'GOLD' },
+        { count: 50, level: 'EMERALD' },
+        { count: 100, level: 'DIAMOND' },
+        { count: 1000, level: 'DOUBLE_DIAMOND' },
+        { count: 10000, level: 'BLACK_DIAMOND' },
+        { count: 100000, level: 'ROYAL_BLACK_DIAMOND' }
+      ];
+
+      const nextMilestone = milestones.find(m => m.count > user.referrals_count);
+      const currentMilestone = [...milestones].reverse().find(m => m.count <= user.referrals_count) || { count: 0, level: 'NONE' };
+
+      res.json({
+        referrals: user.referrals_count,
+        cycles: cycleCount.count,
+        networkSales: user.cycle_sales_count,
+        currentLevel: user.career_level,
+        nextMilestone,
+        currentMilestone,
+        progressToNext: nextMilestone ? ((user.referrals_count - currentMilestone.count) / (nextMilestone.count - currentMilestone.count)) * 100 : 100
+      });
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao buscar progresso" });
+    }
+  });
+
+  app.get("/api/user/matrix/:targetId", authenticateUser, (req: any, res) => {
+    try {
+      const { targetId } = req.params;
+      const isAdmin = isUserAdmin(req.user);
+
+      // Rule: Non-admins can only view matrices they are part of
+      let matrices;
+      if (isAdmin) {
+        matrices = db.prepare(`
+          SELECT DISTINCT m.* 
+          FROM matrices m 
+          JOIN matrix_positions mp ON m.id = mp.matrix_id 
+          WHERE m.status = 'OPEN' AND mp.user_id = ?
+        `).all(targetId);
+      } else {
+        // If not admin, check if the requester (userId) is also in the target's matrix
+        matrices = db.prepare(`
+          SELECT DISTINCT m.* 
+          FROM matrices m 
+          JOIN matrix_positions mp_target ON m.id = mp_target.matrix_id 
+          JOIN matrix_positions mp_requester ON m.id = mp_requester.matrix_id
+          WHERE m.status = 'OPEN' 
+          AND mp_target.user_id = ? 
+          AND mp_requester.user_id = ?
+        `).all(targetId, req.user.id);
+      }
+
+      if (matrices.length === 0) {
+        return res.json([]);
+      }
+
+      const matrixIds = matrices.map((m: any) => m.id);
+      
+      let allPositions: any[] = [];
+      if (matrixIds.length > 0) {
+        if (isAdmin) {
+          allPositions = db.prepare(`
+            SELECT mp.matrix_id, mp.position, mp.user_id as userId, u.name as name, u.nickname as nickname, u.referrals_count as referralsCount, u.status as status, u.career_level as careerLevel, u.balance as balance, u.avatar
+            FROM matrix_positions mp 
+            JOIN users u ON mp.user_id = u.id 
+            JOIN matrices m ON mp.matrix_id = m.id
+            WHERE m.status = 'OPEN' AND mp.matrix_id IN (
+              SELECT m2.id FROM matrices m2 
+              JOIN matrix_positions mp2 ON m2.id = mp2.matrix_id 
+              WHERE m2.status = 'OPEN' AND mp2.user_id = ?
+            )
+          `).all(targetId);
+        } else {
+          allPositions = db.prepare(`
+            SELECT mp.matrix_id, mp.position, mp.user_id as userId, u.name as name, u.nickname as nickname, u.referrals_count as referralsCount, u.status as status, u.career_level as careerLevel, u.balance as balance, u.avatar
+            FROM matrix_positions mp 
+            JOIN users u ON mp.user_id = u.id 
+            WHERE mp.matrix_id IN (
+              SELECT m2.id FROM matrices m2 
+              JOIN matrix_positions mp_target ON m2.id = mp_target.matrix_id 
+              JOIN matrix_positions mp_requester ON m2.id = mp_requester.matrix_id
+              WHERE m2.status = 'OPEN' AND mp_target.user_id = ? AND mp_requester.user_id = ?
+            )
+          `).all(targetId, req.user.id);
+        }
+      }
+
+      const result = matrices.map((m: any) => {
+        const positions = allPositions.filter((p: any) => p.matrix_id === m.id).map((p: any) => ({
+          ...p,
+          userName: p.name,
+          userNickname: p.nickname,
+          status: p.status,
+          careerLevel: p.careerLevel,
+          balance: p.balance,
+          avatar: p.avatar
+        }));
+        return { ...m, positions };
+      });
+
+      // Ensure unique matrices by ID in the final result
+      const uniqueResult = Array.from(new Map(result.map((m: any) => [m.id, m]) as any).values());
+
+      res.json(uniqueResult);
+    } catch (err) {
+      console.error("Error in /api/user/matrix/:targetId:", err);
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.get("/api/admin/user/network/:userId", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { userId } = req.params;
+      const maxDepth = Math.min(parseInt(req.query.depth as string) || 10, 15);
+
+      // Recursive function to build the network tree
+      const getNetwork = (id: string, depth = 0): any => {
+        if (depth >= maxDepth) return [];
+
+        const directReferrals = db.prepare(`
+          SELECT id, name, nickname, status, career_level as careerLevel, avatar, referrals_count as referralsCount, created_at as createdAt 
+          FROM users 
+          WHERE referrer_id = ?
+        `).all(id) as any[];
+
+        return directReferrals.map(ref => {
+          const matrixPos = db.prepare(`
+            SELECT m.type, mp.position 
+            FROM matrix_positions mp 
+            JOIN matrices m ON mp.matrix_id = m.id 
+            WHERE mp.user_id = ? AND m.status = 'OPEN'
+            LIMIT 1
+          `).get(ref.id) as any;
+
+          return {
+            ...ref,
+            matrixType: matrixPos?.type || null,
+            matrixPosition: matrixPos?.position || null,
+            children: getNetwork(ref.id, depth + 1)
+          };
+        });
+      };
+
+      const network = getNetwork(userId);
+      res.json(network);
+    } catch (err) {
+      console.error("Error in /api/admin/user/network:", err);
+      res.status(500).json({ error: "Erro ao buscar rede do usuário" });
+    }
+  });
+
+  app.get("/api/user/network", authenticateUser, (req: any, res) => {
+    try {
+      const maxDepth = Math.min(parseInt(req.query.depth as string) || 10, 15);
+
+      // Recursive function to build the network tree
+      const getNetwork = (id: string, depth = 0): any => {
+        if (depth >= maxDepth) return null; // Limit depth to prevent infinite loops or too much data
+
+        const directReferrals = db.prepare(`
+          SELECT id, name, nickname, status, avatar, referrals_count as referralsCount, created_at as createdAt 
+          FROM users 
+          WHERE referrer_id = ?
+        `).all(id);
+
+        return directReferrals.map(ref => {
+          // Get current matrix position for this user
+          const matrixPos = db.prepare(`
+            SELECT m.type, mp.position 
+            FROM matrix_positions mp 
+            JOIN matrices m ON mp.matrix_id = m.id 
+            WHERE mp.user_id = ? AND m.status = 'OPEN'
+            LIMIT 1
+          `).get(ref.id) as any;
+
+          return {
+            ...ref,
+            matrixType: matrixPos?.type || null,
+            matrixPosition: matrixPos?.position || null,
+            children: getNetwork(ref.id, depth + 1)
+          };
+        });
+      };
+
+      const network = getNetwork(req.user.id);
+      res.json(network);
+    } catch (err) {
+      res.status(500).json({ error: "Erro ao buscar rede" });
+    }
+  });
+
+  app.post("/api/admin/clear-image-cache", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const newVersion = Date.now().toString();
+      ensureSetting('image_cache_version', newVersion);
+      res.json({ success: true, version: newVersion });
+    } catch (err) {
+      console.error("Error clearing image cache:", err);
+      res.status(500).json({ error: "Erro ao limpar cache de imagens" });
+    }
+  });
+
+  app.post("/api/admin/transactions/:id/clawback", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { id } = req.params;
+      const transaction = db.prepare("SELECT * FROM transactions WHERE id = ?").get(id) as any;
+      
+      if (!transaction || transaction.type !== 'ADHESION' || transaction.status === 'REJECTED') {
+        return res.status(400).json({ error: "Transação inválida para estorno" });
+      }
+
+      const buyerId = transaction.user_id;
+      const buyer = db.prepare("SELECT referrer_id FROM users WHERE id = ?").get(buyerId) as any;
+      
+      if (!buyer) return res.status(404).json({ error: "Comprador não encontrado" });
+
+      // 1. Mark original transaction as REJECTED (Estornada)
+      db.prepare("UPDATE transactions SET status = 'REJECTED', description = 'Estornada pelo Administrador' WHERE id = ?").run(id);
+
+      // 2. Identify Uplines (8 levels) and process debt
+      let currentReferrerId = buyer.referrer_id;
+      const visited = new Set<string>();
+      
+      // Process direct referrer first (Special rule: -1 cycle sale)
+      if (currentReferrerId) {
+        db.prepare("UPDATE users SET cycle_sales_count = MAX(0, cycle_sales_count - 1) WHERE id = ?").run(currentReferrerId);
+        NotificationManager.createNotification(currentReferrerId, 'CLAWBACK', 'Uma venda direta foi estornada. -1 ponto no ciclo vigente.');
+      }
+
+      // Find all bonuses related to this sale/user and estorno them
+      // In this prototype, we'll look for bonuses generated around the same time or linked to this user
+      // For simplicity, we'll find the 8 levels of uplines and apply the debt based on the memorandum
+      
+      for (let level = 1; level <= 8; level++) {
+        if (!currentReferrerId || visited.has(currentReferrerId)) break;
+        visited.add(currentReferrerId);
+
+        const upline = db.prepare("SELECT id, balance, debt_balance FROM users WHERE id = ?").get(currentReferrerId) as any;
+        if (!upline) break;
+
+        // Calculate commission to clawback (this would normally be stored in a 'commissions' table linked to the sale)
+        // For the prototype, we'll assume the direct referrer got 150 and others got based on career %
+        let commissionToClawback = 0;
+        if (level === 1) commissionToClawback = 150;
+        else {
+          // Mocking career bonus clawback
+          const adhesionFee = parseFloat(getSetting('matrix_adhesion_fee', '650'));
+          commissionToClawback = adhesionFee * 0.04; // 4% as average
+        }
+
+        let newBalance = upline.balance;
+        let newDebtBalance = upline.debt_balance;
+
+        if (newBalance >= commissionToClawback) {
+          newBalance -= commissionToClawback;
+        } else {
+          newDebtBalance += (commissionToClawback - newBalance);
+          newBalance = 0;
+        }
+
+        db.prepare("UPDATE users SET balance = ?, debt_balance = ? WHERE id = ?").run(newBalance, newDebtBalance, upline.id);
+        db.prepare("INSERT INTO transactions (id, user_id, amount, type, description, status) VALUES (?, ?, ?, 'CLAWBACK', 'Estorno de Comissão (Rede)', 'COMPLETED')").run(
+          generateId("tx"), upline.id, -commissionToClawback
+        );
+
+        NotificationManager.createNotification(upline.id, 'CLAWBACK', `Estorno de comissão processado (R$ ${commissionToClawback.toFixed(2)}).`);
+
+        const next = db.prepare("SELECT referrer_id FROM users WHERE id = ?").get(currentReferrerId) as any;
+        currentReferrerId = next?.referrer_id;
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Error in clawback:", err);
+      res.status(500).json({ error: "Erro ao processar estorno" });
+    }
+  });
+
+  app.get("/api/admin/stats", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const totalUsers = db.prepare("SELECT COUNT(*) as count FROM users").get().count;
+      const totalBalance = db.prepare("SELECT SUM(balance) as sum FROM users").get().sum || 0;
+      const totalCashback = db.prepare("SELECT SUM(cashback_balance) as sum FROM users").get().sum || 0;
+      const totalTransactions = db.prepare("SELECT COUNT(*) as count FROM transactions").get().count;
+      const activeMatrices = db.prepare("SELECT COUNT(*) as count FROM matrices WHERE status = 'OPEN'").get().count;
+      const onBoardMatrices = db.prepare("SELECT COUNT(*) as count FROM matrices WHERE type = 'ONBORD' AND status = 'OPEN'").get().count;
+      const cashBoardMatrices = db.prepare("SELECT COUNT(*) as count FROM matrices WHERE type = 'CASHBOARD' AND status = 'OPEN'").get().count;
+      
+      const cycles = db.prepare("SELECT COUNT(*) as count FROM transactions WHERE type IN ('BONUS', 'CASHBACK') AND description LIKE '%Ciclo%'").get().count;
+      
+      const flowEconomySetting = db.prepare("SELECT value FROM settings WHERE key = 'flow_economy'").get() as any;
+      const flowEconomy = parseFloat(flowEconomySetting?.value || '0');
+
+      // New Metrics
+      const totalRevenue = db.prepare("SELECT SUM(amount) as sum FROM transactions WHERE type = 'ADHESION' AND status = 'COMPLETED'").get().sum || 0;
+      const totalBonusPaid = db.prepare("SELECT SUM(amount) as sum FROM transactions WHERE type = 'BONUS' AND status = 'COMPLETED'").get().sum || 0;
+      
+      // Tax generation (7.5% of total revenue)
+      const totalTaxes = totalRevenue * 0.075;
+      
+      const totalSnackCashback = db.prepare("SELECT SUM(snack_fast_cashback) as sum FROM users").get().sum || 0;
+      const totalEnergyCashback = db.prepare("SELECT SUM(energy_cashback) as sum FROM users").get().sum || 0;
+      const totalGuinchoCashback = db.prepare("SELECT SUM(guincho_cashback) as sum FROM users").get().sum || 0;
+      const totalHabilityCashback = db.prepare("SELECT SUM(hability_test_cashback) as sum FROM users").get().sum || 0;
+      const totalMecanicaCashback = db.prepare("SELECT SUM(mecanica_cashback) as sum FROM users").get().sum || 0;
+      
+      // Active users (users with transactions in the last 30 days)
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+      const activeUsers = db.prepare("SELECT COUNT(DISTINCT user_id) as count FROM transactions WHERE created_at > ?").get(thirtyDaysAgo).count;
+
+      // Network Growth (last 7 days)
+      const growthData = [];
+      for (let i = 6; i >= 0; i--) {
+        const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const count = db.prepare("SELECT COUNT(*) as count FROM users WHERE created_at LIKE ?").get(`${date}%`).count;
+        growthData.push({ date, count });
+      }
+
+      // Revenue History (last 7 days)
+      const revenueHistory = [];
+      for (let i = 6; i >= 0; i--) {
+        const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const amount = db.prepare("SELECT SUM(amount) as sum FROM transactions WHERE type = 'ADHESION' AND status = 'COMPLETED' AND created_at LIKE ?").get(`${date}%`).sum || 0;
+        revenueHistory.push({ date, amount });
+      }
+
+      res.json({
+        totalUsers,
+        activeUsers,
+        totalBalance,
+        totalCashback,
+        totalSnackCashback,
+        totalEnergyCashback,
+        totalGuinchoCashback,
+        totalHabilityCashback,
+        totalMecanicaCashback,
+        totalTransactions,
+        activeMatrices,
+        onBoardMatrices,
+        cashBoardMatrices,
+        cycles,
+        flowEconomy,
+        totalRevenue,
+        totalBonusPaid,
+        totalTaxes,
+        growthData,
+        revenueHistory
+      });
+    } catch (err) {
+      console.error("Stats error:", err);
+      res.status(500).json({ error: "Erro ao buscar estatísticas" });
+    }
+  });
+
+   app.get("/api/admin/users", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = parseInt(req.query.limit as string) || 20;
+      const search = (req.query.search as string) || "";
+      const offset = (page - 1) * limit;
+
+      let countQuery = "SELECT COUNT(*) as count FROM users";
+      let usersQuery = `
+        SELECT 
+          id, 
+          name, 
+          nickname, 
+          email, 
+          cpf, 
+          phone, 
+          pix_key as pixKey, 
+          birth_date as birthDate, 
+          avatar, 
+          referrals_count as referralsCount, 
+          balance, 
+          debt_balance as debtBalance,
+          cashback_balance, 
+          snack_fast_cashback,
+          energy_cashback,
+          guincho_cashback,
+          hability_test_cashback,
+          mecanica_cashback,
+          voucher_balance as voucherBalance,
+          document_status as documentStatus,
+          stars, 
+          status,
+          career_level as careerLevel,
+          referral_code as referralCode,
+          reentry_mode as reentryMode
+        FROM users 
+      `;
+
+      const params: any[] = [];
+      if (search) {
+        const searchClause = " WHERE name LIKE ? OR email LIKE ? OR id LIKE ? OR nickname LIKE ? ";
+        countQuery += searchClause;
+        usersQuery += searchClause;
+        const searchParam = `%${search}%`;
+        params.push(searchParam, searchParam, searchParam, searchParam);
+      }
+
+      usersQuery += " ORDER BY created_at DESC LIMIT ? OFFSET ? ";
+      
+      const totalCount = (db.prepare(countQuery).get(...params) as any).count;
+      const users = db.prepare(usersQuery).all(...params, limit, offset);
+
+      res.json({
+        users,
+        total: totalCount,
+        page,
+        limit
+      });
+    } catch (err) {
+      console.error("Error in /api/admin/users:", err);
+      res.status(500).json({ error: "Erro interno ao buscar usuários" });
+    }
+  });
+
+  app.post("/api/admin/users/:id/status", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+      db.prepare("UPDATE users SET status = ? WHERE id = ?").run(status, id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.post("/api/admin/users/:id/update", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const { id } = req.params;
+      const { field, value } = req.body;
+      
+      const allowedFields = [
+        'balance', 
+        'cashback_balance', 
+        'snack_fast_cashback', 
+        'energy_cashback', 
+        'guincho_cashback', 
+        'hability_test_cashback', 
+        'mecanica_cashback', 
+        'voucher_balance', 
+        'document_status', 
+        'stars', 
+        'status', 
+        'career_level'
+      ];
+      if (!allowedFields.includes(field)) {
+        return res.status(400).json({ error: "Campo não permitido" });
+      }
+
+      db.prepare(`UPDATE users SET ${field} = ? WHERE id = ?`).run(value, id);
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: "Erro interno" });
+    }
+  });
+
+  app.get("/api/admin/transactions", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      const transactions = db.prepare(`
+        SELECT 
+          t.id, 
+          t.user_id as userId,
+          t.amount, 
+          t.type, 
+          t.description, 
+          t.status, 
+          t.created_at as createdAt, 
+          u.name as userName, 
+          u.email as userEmail 
+        FROM transactions t 
+        JOIN users u ON t.user_id = u.id 
+        ORDER BY t.created_at DESC 
+        LIMIT 100
+      `).all();
+      res.json(transactions);
+    } catch (err) {
+      console.error("Error in /api/admin/transactions:", err);
+      res.status(500).json({ error: "Erro interno ao buscar transações" });
+    }
+  });
+
+  app.post("/api/admin/reset-all", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      console.log(`DEBUG: [POST /api/admin/reset-all] Full system reset requested by user ${req.headers['x-user-id']}`);
+      const result = UserManager.resetSystem();
+      if (!result.success) {
+        console.error("DEBUG: Reset failed:", result.error);
+        return res.status(500).json({ error: result.error || "Erro interno ao resetar sistema" });
+      }
+      console.log("DEBUG: Reset successful");
+      res.json({ success: true, message: "Sistema resetado com sucesso!" });
+    } catch (err: any) {
+      console.error("Error in /api/admin/reset-all:", err);
+      res.status(500).json({ error: err.message || "Erro interno do servidor ao resetar" });
+    }
+  });
+
+  app.post("/api/admin/clear-ghosts", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      console.log("DEBUG: Clearing ghost entries...");
+      db.transaction(() => {
+        // Remove sys_explosion and sys_admin_001 from positions 4, 5, 6, 7 (entries)
+        db.prepare(`
+          DELETE FROM matrix_positions 
+          WHERE (user_id = 'sys_explosion' OR user_id = 'sys_admin_001') 
+          AND position IN (4, 5, 6, 7)
+        `).run();
+        
+        // Also remove them from history in those positions to be clean
+        db.prepare(`
+          DELETE FROM matrix_history 
+          WHERE (user_id = 'sys_explosion' OR user_id = 'sys_admin_001') 
+          AND position IN (4, 5, 6, 7)
+        `).run();
+      })();
+
+      res.json({ success: true, message: "Entradas fantasmas removidas com sucesso!" });
+    } catch (err) {
+      console.error("Error in /api/admin/clear-ghosts:", err);
+      res.status(500).json({ error: "Erro interno do servidor ao limpar fantasmas" });
+    }
+  });
+
+  app.post("/api/admin/generate-logo", authenticateUser, authorizeAdmin, async (req, res) => {
+    try {
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ error: "GEMINI_API_KEY is not set." });
+      }
+
+      const ai = new GoogleGenAI({ apiKey });
+      const prompt = "Logo for the app 'MOBICYCLE'. Modern, minimalist style. Colors: neon green and neon blue. Central symbol: a stylized coin with a curved arrow indicating cashback, connecting to waves resembling a Wi-Fi signal or map routes. Background: deep navy blue or graphite. Typography: 'MOBICYCLE' in modern, rounded, clean font.";
+
+      console.log("Generating logo via API...");
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash-image",
+        contents: [{ parts: [{ text: prompt }] }],
+        config: {
+          imageConfig: {
+            aspectRatio: "1:1",
+            imageSize: "1K"
+          }
+        }
+      });
+
+      let imagePartFound = false;
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+          const base64Data = part.inlineData.data;
+          const buffer = Buffer.from(base64Data, "base64");
+          const outputPath = path.join(__dirname, "public/logo.png");
+          
+          // Ensure public directory exists
+          if (!fs.existsSync(path.join(__dirname, "public"))) {
+            fs.mkdirSync(path.join(__dirname, "public"));
+          }
+          
+          fs.writeFileSync(outputPath, buffer);
+          console.log(`Logo saved to ${outputPath}`);
+          imagePartFound = true;
+          break;
+        }
+      }
+
+      if (imagePartFound) {
+        const version = Date.now();
+        const newLogoUrl = `/logo.png?v=${version}`;
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run('logo_url', newLogoUrl);
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").run('image_cache_version', String(version));
+        
+        res.json({ success: true, message: "Logo gerado e aplicado com sucesso!", url: newLogoUrl });
+      } else {
+        res.status(500).json({ error: "Nenhuma imagem foi gerada pelo modelo." });
+      }
+    } catch (err) {
+      console.error("Error generating logo:", err);
+      res.status(500).json({ error: "Erro ao gerar logo: " + (err instanceof Error ? err.message : String(err)) });
+    }
+  });
+
+  app.post("/api/admin/seed", authenticateUser, authorizeAdmin, (req, res) => {
+    console.log("DEBUG: [POST /api/admin/seed] Unified reset triggered");
+    const result = UserManager.resetSystem();
+    if (result.success) {
+      res.json({ success: true });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+  });
+
+  // Vite middleware for development
+  const isProd = process.env.NODE_ENV === "production";
+  if (!isProd) {
+    console.log("Starting in DEVELOPMENT mode with Vite middleware");
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    console.log("Starting in PRODUCTION mode");
+    app.use(express.static(path.join(__dirname, "dist")));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(__dirname, "dist", "index.html"));
+    });
+  }
+
+  // Ensure system users and initial matrices exist before starting
+  try {
+    UserManager.ensureSystemUsers();
+    MatrixManager.seedInitialMatrices();
+
+    // One-time reset requested by user (v20)
+    const RESET_KEY_V20 = 'matrix_reset_v20';
+    const alreadyResetV20 = db.prepare("SELECT value FROM settings WHERE key = ?").get(RESET_KEY_V20);
+    if (!alreadyResetV20) {
+      console.log("DEBUG: Performing one-time matrix reset requested by user (v20)...");
+      try {
+        const result = UserManager.resetSystem();
+        if (result.success) {
+          db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, 'true')").run(RESET_KEY_V20);
+          console.log("DEBUG: One-time reset v20 completed successfully.");
+        } else {
+          console.error("Error during one-time reset v20:", result.error);
+        }
+      } catch (err) {
+        console.error("Error during one-time reset v20:", err);
+      }
+    }
+    
+    // Always ensure system users exist on startup
+    UserManager.ensureSystemUsers();
+  } catch (err) {
+    console.error("CRITICAL: Error during system initialization:", err);
+  }
+
+  app.post("/api/admin/force-reset", authenticateUser, authorizeAdmin, (req, res) => {
+    try {
+      console.log(`DEBUG: [POST /api/admin/force-reset] Unified reset triggered by user ${req.headers['x-user-id']}`);
+      const result = UserManager.resetSystem();
+      if (result.success) {
+        res.json({ success: true, message: "Sistema resetado com sucesso!" });
+      } else {
+        console.error("DEBUG: Force reset failed:", result.error);
+        res.status(500).json({ error: result.error || "Erro ao resetar sistema" });
+      }
+    } catch (err: any) {
+      console.error("Error in /api/admin/force-reset:", err);
+      res.status(500).json({ error: err.message || "Erro interno do servidor" });
+    }
+  });
+
+  app.get("/api/generate-logo", authenticateUser, authorizeAdmin, async (req, res) => {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "GEMINI_API_KEY is not set." });
+    }
+
+    const { GoogleGenAI } = await import("@google/genai");
+    const ai = new GoogleGenAI({ apiKey });
+    const prompt = "A modern and minimalist logo for an app called 'MOBICYCLE'. The central symbol is a stylized, floating coin in glowing neon green. In the center of the coin, instead of a dollar sign ($), there is a curved arrow wrapping around the edge (indicating cashback) that subtly connects to waves resembling a Wi-Fi signal or map routes in light blue. The background is a deep navy blue or graphite. The typography for the app name 'MOBICYCLE' should be modern, sans-serif, rounded, and clean.";
+
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash-image",
+        contents: [{ parts: [{ text: prompt }] }],
+        config: {
+          imageConfig: {
+            aspectRatio: "1:1",
+            imageSize: "1K"
+          }
+        }
+      });
+
+      let imagePartFound = false;
+      for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+          const base64Data = part.inlineData.data;
+          const buffer = Buffer.from(base64Data, "base64");
+          const outputPath = path.join(__dirname, "public/logo.png");
+          const fs = await import("fs");
+          fs.writeFileSync(outputPath, buffer);
+          imagePartFound = true;
+          break;
+        }
+      }
+
+      if (imagePartFound) {
+        res.json({ success: true, message: "Logo generated and saved to public/logo.png" });
+      } else {
+        res.status(500).json({ error: "No image part found in the response." });
+      }
+    } catch (error) {
+      res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
+    }
+  });
+
+  app.get("/DEVELOPER.md", (req, res) => {
+    res.sendFile(path.join(process.cwd(), "DEVELOPER.md"));
+  });
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  });
+}
+
+startServer().catch(err => {
+  console.error("Failed to start server:", err);
+});
