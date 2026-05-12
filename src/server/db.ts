@@ -308,6 +308,19 @@ async function createSchema(): Promise<void> {
       FOREIGN KEY (user_id) REFERENCES users(id),
       FOREIGN KEY (badge_id) REFERENCES badges(id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+    `CREATE TABLE IF NOT EXISTS mercadopago_deposit_orders (
+      id VARCHAR(255) NOT NULL PRIMARY KEY,
+      user_id VARCHAR(255) NOT NULL,
+      amount DOUBLE NOT NULL,
+      preference_id VARCHAR(255) NOT NULL,
+      mp_payment_id VARCHAR(255) NULL,
+      status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      UNIQUE KEY uk_mp_pref (preference_id),
+      UNIQUE KEY uk_mp_payment (mp_payment_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
 
   for (const stmt of statements) {

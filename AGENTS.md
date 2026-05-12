@@ -1,6 +1,6 @@
 # 🤖 AI Agents Guidelines
 <!-- n8n-as-code-start -->
-<!-- n8nac-version: 2.1.0 -->
+<!-- n8nac-version: 2.1.2 -->
 
 ## n8n-as-code Context Root
 
