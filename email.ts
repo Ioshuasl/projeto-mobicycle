@@ -1,7 +1,12 @@
 import nodemailer from 'nodemailer';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-dotenv.config();
+const __root = path.dirname(fileURLToPath(import.meta.url));
+// Defaults do repositório (incl. DB_HOST remoto para dev). `.env` sobrescreve; variáveis já definidas (ex.: Docker) não são trocadas.
+dotenv.config({ path: path.join(__root, '.env.example') });
+dotenv.config({ path: path.join(__root, '.env'), override: true });
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,

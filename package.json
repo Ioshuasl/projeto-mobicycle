@@ -10,6 +10,8 @@
     "preview": "vite preview",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "db:test": "tsx scripts/test-mysql-connection.ts",
+    "db:test:remote": "cross-env DB_TEST_HOST=187.77.254.38 tsx scripts/test-mysql-connection.ts",
+    "db:dump-sample": "tsx scripts/dump-db-schema-and-sample.ts",
     "db:clone-from-remote": "tsx scripts/clone-db-from-remote.ts",
     "docker:mysql:pull": "docker pull mysql:8.0",
     "docker:mysql:up": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/docker-mysql-up.ps1",

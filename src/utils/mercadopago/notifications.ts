@@ -62,6 +62,64 @@ export function extractWebhookQueryDataId(query: Record<string, unknown>): strin
 }
 
 /**
+ * `data.id` para o manifest da x-signature: query (como na doc MP) ou, em POST só JSON, corpo.
+ */
+/** Normaliza o `id` do manifest x-signature (doc MP: alfanuméricos em minúsculas). */
+export function normalizeMercadoPagoWebhookManifestDataId(dataId: string): string {
+  let id = dataId.trim();
+  if (!id) return id;
+  if (/^[a-zA-Z0-9]+$/.test(id)) {
+    id = id.toLowerCase();
+  }
+  return id;
+}
+
+/**
+ * Candidatos ao `id:` do manifest HMAC — o MP nem sempre manda `data.id` na query
+ * (ex.: `merchant_order` com `?id=` e corpo `{ resource, topic }`).
+ * A validação deve aceitar qualquer candidato que reproduza o `v1` recebido.
+ */
+export function collectWebhookSignatureDataIdCandidates(
+  query: Record<string, unknown>,
+  body?: unknown
+): string[] {
+  const out: string[] = [];
+  const push = (raw: unknown) => {
+    if (raw == null || raw === '') return;
+    const s = String(raw).trim();
+    if (s && !out.includes(s)) out.push(s);
+  };
+
+  push(query['data.id']);
+  push(query.id);
+
+  if (body && typeof body === 'object') {
+    const b = body as MercadoPagoWebhookBody;
+    const res = b.resource;
+    if (typeof res === 'string' && res.trim()) {
+      try {
+        const u = new URL(res, 'https://api.mercadopago.com');
+        const parts = u.pathname.split('/').filter(Boolean);
+        const last = parts[parts.length - 1];
+        if (last) push(last);
+      } catch {
+        const m = res.match(/(\d+)\s*$/);
+        if (m) push(m[1]);
+      }
+    }
+    push(b.data?.id);
+    push(b.id);
+  }
+
+  return out;
+}
+
+export function extractWebhookSignatureDataId(query: Record<string, unknown>, body?: unknown): string {
+  const candidates = collectWebhookSignatureDataIdCandidates(query, body);
+  return candidates[0] ?? '';
+}
+
+/**
  * Extrai o ID do pagamento de um POST JSON ou query (?topic=payment&id= ou data.id=).
  */
 export function extractPaymentIdFromNotification(
@@ -148,19 +206,15 @@ export function parseMercadoPagoXsSignatureHeader(xSignatureHeader: string): Par
 }
 
 /**
- * Monta a string do manifest e calcula HMAC-SHA256 (hex), conforme documentação MP.
- * Segmentos ausentes devem ser omitidos do manifest.
+ * Monta a string do manifest (sempre os três segmentos, como na documentação oficial do MP).
+ * @see https://www.mercadopago.com.br/developers/pt/docs/your-integrations/notifications/webhooks
  */
 export function buildMercadoPagoWebhookSignatureManifest(
   dataId: string,
   xRequestId: string,
   ts: string
 ): string {
-  let manifest = '';
-  if (dataId) manifest += `id:${dataId};`;
-  if (xRequestId) manifest += `request-id:${xRequestId};`;
-  if (ts) manifest += `ts:${ts};`;
-  return manifest;
+  return `id:${dataId};request-id:${xRequestId};ts:${ts};`;
 }
 
 export function computeMercadoPagoWebhookSignature(secret: string, manifest: string): string {
@@ -172,15 +226,17 @@ export type VerifyMercadoPagoWebhookSignatureParams = {
   secret: string;
   headers: Record<string, unknown>;
   query: Record<string, unknown>;
+  /** Corpo JSON do POST (opcional) — MP pode enviar `data.id` só no body. */
+  body?: unknown;
 };
 
 /**
- * Valida header `x-signature` (HMAC-SHA256 do manifest com `data.id` da query, `x-request-id`, `ts`).
+ * Valida header `x-signature` (HMAC-SHA256 do manifest com `data.id`, `x-request-id`, `ts`).
  * Retorna false se headers incompletos ou assinatura inválida.
  * @see https://mercadopago.com/developers/pt/docs/your-integrations/notifications/webhooks
  */
 export function verifyMercadoPagoWebhookSignature(params: VerifyMercadoPagoWebhookSignatureParams): boolean {
-  const { secret, headers, query } = params;
+  const { secret, headers, query, body } = params;
   if (!secret?.trim()) return false;
 
   const xSignature = getMercadoPagoWebhookHeader(headers, 'x-signature');
@@ -188,18 +244,24 @@ export function verifyMercadoPagoWebhookSignature(params: VerifyMercadoPagoWebho
   const { ts, v1 } = parseMercadoPagoXsSignatureHeader(xSignature);
 
   if (!v1 || !ts || !xRequestId) return false;
+  if (!/^[0-9a-f]+$/i.test(v1)) return false;
 
-  const dataId = extractWebhookQueryDataId(query);
-  const manifest = buildMercadoPagoWebhookSignatureManifest(dataId, xRequestId, ts);
-  if (!manifest) return false;
+  const v1Buf = Buffer.from(v1, 'hex');
+  const candidates = collectWebhookSignatureDataIdCandidates(query, body);
+  if (candidates.length === 0) return false;
 
-  const computed = computeMercadoPagoWebhookSignature(secret.trim(), manifest);
-  if (!/^[0-9a-f]+$/i.test(v1) || computed.length !== v1.length) return false;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(computed, 'hex'), Buffer.from(v1, 'hex'));
-  } catch {
-    return false;
+  for (const raw of candidates) {
+    const dataId = normalizeMercadoPagoWebhookManifestDataId(raw);
+    const manifest = buildMercadoPagoWebhookSignatureManifest(dataId, xRequestId, ts);
+    const computed = computeMercadoPagoWebhookSignature(secret.trim(), manifest);
+    if (computed.length !== v1.length) continue;
+    try {
+      if (crypto.timingSafeEqual(Buffer.from(computed, 'hex'), v1Buf)) return true;
+    } catch {
+      /* tamanho inválido — tenta próximo candidato */
+    }
   }
+  return false;
 }
 
 /**
@@ -207,9 +269,10 @@ export function verifyMercadoPagoWebhookSignature(params: VerifyMercadoPagoWebho
  */
 export function verifyMercadoPagoWebhookSignatureFromEnv(
   headers: Record<string, unknown>,
-  query: Record<string, unknown>
+  query: Record<string, unknown>,
+  body?: unknown
 ): boolean {
   const secret = process.env.MERCADOPAGO_WEBHOOK_SECRET?.trim();
   if (!secret) return false;
-  return verifyMercadoPagoWebhookSignature({ secret, headers, query });
+  return verifyMercadoPagoWebhookSignature({ secret, headers, query, body });
 }

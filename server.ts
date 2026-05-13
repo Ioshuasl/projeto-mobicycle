@@ -21,6 +21,16 @@ import { updateCareerLevel, generateReferralCode } from "./src/server/utils.ts";
 import logger, { httpLogger } from "./src/server/logger.ts";
 import { errorHandler, catchAsync } from "./src/server/errorHandler.ts";
 import { loginSchema, registerSchema } from "./src/server/schemas.ts";
+import {
+  isMercadoPagoConfigured,
+  createCheckoutProPreferenceWithAppPaths,
+  extractMerchantOrderIdFromNotification,
+  extractPaymentIdFromNotification,
+  verifyMercadoPagoWebhookSignatureFromEnv,
+  getMercadoPagoPaymentById,
+  isMercadoPagoPaymentApproved,
+  fetchMercadoPagoMerchantOrderById,
+} from "./src/utils/mercadopago/index.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -37,12 +47,160 @@ const escapeHtml = (str: string) => str
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&#039;');
 
+const LICENSE_CHECKOUT_PREFIX = "license:";
+
+/** Idempotente: retorna sem efeito se a licença já estiver ativa (reentrega de webhook). */
+async function activateUserLicenseAfterGatewayPayment(userId: string, adhesionFee: number): Promise<void> {
+  console.log("[debug:license][activateUserLicenseAfterGatewayPayment] entrada", { userId, adhesionFee });
+  const user = (await db.prepare("SELECT * FROM users WHERE id = ?").get(userId)) as any;
+  if (!user) throw new Error(`Usuário não encontrado: ${userId}`);
+  if (user.is_activated) {
+    console.log("[debug:license][activateUserLicenseAfterGatewayPayment] usuário já is_activated=1 — noop", {
+      userId,
+    });
+    return;
+  }
+
+  await db.prepare("UPDATE users SET is_activated = 1 WHERE id = ?").run(userId);
+
+  await db
+    .prepare(
+      "INSERT INTO transactions (id, user_id, amount, type, description, status) VALUES (?, ?, ?, 'ADHESION', 'Ativação de Licença de Uso', 'COMPLETED')"
+    )
+    .run(generateId("tx"), userId, adhesionFee);
+
+  if (user.referrer_id) {
+    await FinancialManager.addReferralBonus(user.referrer_id, userId);
+    await FinancialManager.payLicenseUnilevelBonus(userId);
+    await FinancialManager.payInfiniteBonus(userId, adhesionFee);
+  }
+
+  const openMatrices = (await db
+    .prepare("SELECT id FROM matrices WHERE type = 'ONBORD' AND status = 'OPEN' ORDER BY created_at ASC")
+    .all()) as any[];
+  let targetMatrix = openMatrices.length > 0 ? openMatrices[0] : null;
+  if (!targetMatrix) {
+    targetMatrix = await MatrixManager.createMatrix("ONBORD");
+  }
+  await MatrixManager.fillPosition(targetMatrix.id, userId);
+  console.log("[debug:license][activateUserLicenseAfterGatewayPayment] concluído", {
+    userId,
+    matrixId: targetMatrix.id,
+  });
+}
+
+type MercadoPagoPaymentLike = {
+  id?: unknown;
+  status?: string;
+  external_reference?: string | null;
+  currency_id?: string;
+  transaction_amount?: number;
+};
+
+/**
+ * Processa um pagamento MP já carregado: se for checkout de licença (`license:*`), ativa e marca checkout.
+ * @returns `activated` se a licença foi ativada nesta execução; `skipped` caso contrário (outro tipo de pagamento, pendente, valor divergente, etc.).
+ */
+async function tryActivateLicenseFromMercadoPagoPayment(
+  payment: MercadoPagoPaymentLike,
+  paymentIdFallback: string
+): Promise<"activated" | "skipped"> {
+  const extRefRaw = payment.external_reference;
+  const extRef = typeof extRefRaw === "string" ? extRefRaw.trim() : "";
+  if (!extRef || !extRef.startsWith(LICENSE_CHECKOUT_PREFIX)) {
+    console.log("[debug:license][/api/webhooks/mercadopago] external_reference não é license:* , ACK", {
+      extRef,
+      paymentStatus: payment.status,
+    });
+    return "skipped";
+  }
+
+  const checkout = (await db
+    .prepare("SELECT * FROM license_checkouts WHERE external_reference = ?")
+    .get(extRef)) as {
+    id: string;
+    user_id: string;
+    amount: number;
+    status: string;
+    external_reference: string;
+  } | null;
+
+  if (!checkout) {
+    logger.warn(`[MP webhook] license_checkouts não encontrado para external_reference=${extRef}`);
+    console.log("[debug:license][/api/webhooks/mercadopago] license_checkouts NÃO encontrado", { extRef });
+    return "skipped";
+  }
+  console.log("[debug:license][/api/webhooks/mercadopago] checkout encontrado", {
+    checkoutId: checkout.id,
+    userId: checkout.user_id,
+    status: checkout.status,
+    amount: checkout.amount,
+  });
+  const mpId = payment.id != null ? String(payment.id) : paymentIdFallback;
+  const mpStatus = String(payment.status ?? "");
+
+  await db
+    .prepare(
+      "UPDATE license_checkouts SET mp_payment_id = ?, mp_payment_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    )
+    .run(mpId, mpStatus, checkout.id);
+
+  if (!isMercadoPagoPaymentApproved(payment as Parameters<typeof isMercadoPagoPaymentApproved>[0])) {
+    console.log("[debug:license][/api/webhooks/mercadopago] pagamento não approved, ACK", {
+      mpStatus: payment.status,
+    });
+    return "skipped";
+  }
+
+  const currency = String((payment as { currency_id?: string }).currency_id || "BRL");
+  if (currency !== "BRL") {
+    logger.warn(`[MP webhook] moeda inesperada ${currency} para checkout ${checkout.id}`);
+    console.log("[debug:license][/api/webhooks/mercadopago] moeda != BRL, ACK", { currency });
+    return "skipped";
+  }
+
+  const paid = Number((payment as { transaction_amount?: number }).transaction_amount);
+  if (!Number.isFinite(paid) || Math.abs(paid - Number(checkout.amount)) > 0.02) {
+    logger.warn(
+      `[MP webhook] valor divergente para checkout ${checkout.id}: pago=${paid} esperado=${checkout.amount}`
+    );
+    console.log("[debug:license][/api/webhooks/mercadopago] valor divergente, ACK", { paid, esperado: checkout.amount });
+    return "skipped";
+  }
+
+  console.log("[debug:license][/api/webhooks/mercadopago] chamando activateUserLicenseAfterGatewayPayment", {
+    userId: checkout.user_id,
+    amount: checkout.amount,
+  });
+  await activateUserLicenseAfterGatewayPayment(checkout.user_id, Number(checkout.amount));
+
+  await db
+    .prepare(
+      `UPDATE license_checkouts SET
+        status = 'ACTIVATED',
+        activated_at = COALESCE(activated_at, CURRENT_TIMESTAMP),
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?`
+    )
+    .run(checkout.id);
+
+  logger.info(
+    `[MP webhook] licença ativada payment=${mpId} user=${checkout.user_id} checkout=${checkout.id}`
+  );
+  console.log("[debug:license][/api/webhooks/mercadopago] licença ativada + checkout ACTIVATED", {
+    mpId,
+    userId: checkout.user_id,
+    checkoutId: checkout.id,
+  });
+  return "activated";
+}
+
 async function startServer() {
   // Inicializa banco de dados MySQL (aguarda conexão + schema + seeds)
   await initDatabase();
-  await connectRedis();
+  const redisOk = await connectRedis();
   await initNotifications();
-  logger.info('[System] Services initialized (MySQL + Redis)');
+  logger.info(`[System] Services initialized (MySQL + ${redisOk ? 'Redis' : 'Redis skipped (dev, in-memory limits)'})`);
 
   // Update career levels for all users on startup
   logger.info('[System] Updating career levels...');
@@ -70,11 +228,20 @@ async function startServer() {
     crossOriginEmbedderPolicy: false,
   }));
 
-  // Rate Limiting (S17) - Migrated to Redis for Cluster Support
+  // Rate Limiting (S17) — Redis em produção/cluster; em dev sem Redis usa store em memória (padrão do express-rate-limit).
+  const authRedisStore = redisOk
+    ? new RedisStore({
+        sendCommand: (...args: string[]) => redisClient.sendCommand(args),
+      })
+    : undefined;
+  const apiRedisStore = redisOk
+    ? new RedisStore({
+        sendCommand: (...args: string[]) => redisClient.sendCommand(args),
+      })
+    : undefined;
+
   const authLimiter = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.sendCommand(args),
-    }),
+    ...(authRedisStore ? { store: authRedisStore } : {}),
     windowMs: 15 * 60 * 1000, // 15 minutes
     max: 15, // max 15 login/register attempts per window
     message: { error: "Muitas tentativas. Aguarde 15 minutos antes de tentar novamente." },
@@ -83,9 +250,7 @@ async function startServer() {
   });
 
   const apiLimiter = rateLimit({
-    store: new RedisStore({
-      sendCommand: (...args: string[]) => redisClient.sendCommand(args),
-    }),
+    ...(apiRedisStore ? { store: apiRedisStore } : {}),
     windowMs: 60 * 1000, // 1 minute
     max: 120, // 120 requests per minute per IP
     message: { error: "Limite de requisições excedido. Tente novamente em instantes." },
@@ -262,6 +427,7 @@ async function startServer() {
       if (!user) {
         return res.status(401).json({ error: "Não autenticado" });
       }
+      console.log("[debug:license][/api/me]", { userId: user.id, isActivated: user.isActivated });
       res.json(user);
     } catch (err) {
       console.error("Error in /api/me:", err);
@@ -550,6 +716,10 @@ async function startServer() {
   app.post("/api/user/activate", authenticateUser, async (req: any, res) => {
     try {
       const { userId } = req.body;
+      console.log("[debug:license][/api/user/activate]", {
+        authUserId: req.user.id,
+        bodyUserId: userId,
+      });
       if (req.user.id !== userId && !isUserAdmin(req.user)) {
         return res.status(403).json({ error: "Acesso negado" });
       }
@@ -563,29 +733,10 @@ async function startServer() {
         return res.status(400).json({ error: "Licença já está ativa" });
       }
 
-      await db.prepare("UPDATE users SET is_activated = 1 WHERE id = ?").run(userId);
-      
       const adhesionFee = parseFloat(await getSetting('matrix_adhesion_fee', '650'));
-      
-      await db.prepare("INSERT INTO transactions (id, user_id, amount, type, description, status) VALUES (?, ?, ?, 'ADHESION', 'Ativação de Licença de Uso', 'COMPLETED')").run(
-        generateId("tx"), userId, adhesionFee
-      );
+      await activateUserLicenseAfterGatewayPayment(userId, adhesionFee);
 
-      // Pay bonuses
-      if (user.referrer_id) {
-        await FinancialManager.addReferralBonus(user.referrer_id, userId);
-        await FinancialManager.payLicenseUnilevelBonus(userId);
-        await FinancialManager.payInfiniteBonus(userId, adhesionFee);
-      }
-
-      // Add user to ONBORD matrix
-      const openMatrices = await db.prepare("SELECT id FROM matrices WHERE type = 'ONBORD' AND status = 'OPEN' ORDER BY created_at ASC").all() as any[];
-      let targetMatrix = openMatrices.length > 0 ? openMatrices[0] : null;
-      if (!targetMatrix) {
-        targetMatrix = await MatrixManager.createMatrix('ONBORD');
-      }
-      await MatrixManager.fillPosition(targetMatrix.id, userId);
-
+      console.log("[debug:license][/api/user/activate] concluído com sucesso", { userId });
       res.json({ success: true });
     } catch (err) {
       console.error("Error in /api/user/activate:", err);
@@ -593,10 +744,289 @@ async function startServer() {
     }
   });
 
+  /**
+   * Checkout Pro (Mercado Pago) para taxa de adesão da licença.
+   * Persiste em license_checkouts; ativação (is_activated) ocorre após webhook confirmar pagamento.
+   */
+  app.post("/api/license/checkout-pro", authenticateUser, async (req: any, res) => {
+    try {
+      if (!isMercadoPagoConfigured()) {
+        return res.status(503).json({
+          error: "Pagamento não configurado. Defina MERCADOPAGO_ACCESS_TOKEN no servidor.",
+        });
+      }
+
+      const userId = req.user.id as string;
+      const user = (await db
+        .prepare(
+          "SELECT id, email, name, is_activated as isActivated FROM users WHERE id = ?"
+        )
+        .get(userId)) as { id: string; email: string | null; name: string | null; isActivated: number } | null;
+
+      console.log("[debug:license][/api/license/checkout-pro] início", { userId, hasUser: !!user });
+      if (!user) {
+        return res.status(404).json({ error: "Usuário não encontrado" });
+      }
+      if (user.isActivated) {
+        return res.status(400).json({ error: "Licença já está ativa" });
+      }
+      const email = (user.email ?? "").trim();
+      if (!email) {
+        return res.status(400).json({ error: "Cadastre um e-mail na conta para pagar com Mercado Pago." });
+      }
+
+      const adhesionFee = parseFloat(await getSetting("matrix_adhesion_fee", "650"));
+      if (!Number.isFinite(adhesionFee) || adhesionFee <= 0) {
+        return res.status(500).json({ error: "Valor de adesão inválido nas configurações." });
+      }
+
+      const checkoutId = generateId("lc");
+      const externalReference = `${LICENSE_CHECKOUT_PREFIX}${checkoutId}`;
+
+      const nameParts = (user.name ?? "").trim().split(/\s+/);
+      const firstName = nameParts[0] || "Cliente";
+      const surname = nameParts.length > 1 ? nameParts.slice(1).join(" ") : undefined;
+
+      const pref = await createCheckoutProPreferenceWithAppPaths({
+        externalReference,
+        title: "Licença de Uso MOBICYCLE — Taxa de adesão",
+        itemId: "license_adhesion",
+        amount: adhesionFee,
+        payer: { email, name: firstName, surname },
+        statementDescriptor: "MOBICYCLE",
+        successPath: "/?licensePayment=success",
+        pendingPath: "/?licensePayment=pending",
+        failurePath: "/?licensePayment=failure",
+      });
+
+      await db
+        .prepare(
+          `INSERT INTO license_checkouts (
+            id, user_id, external_reference, preference_id, amount, currency_id, status
+          ) VALUES (?, ?, ?, ?, ?, 'BRL', 'PENDING')`
+        )
+        .run(checkoutId, userId, externalReference, pref.preferenceId, adhesionFee);
+
+      console.log("[debug:license][/api/license/checkout-pro] preferência criada", {
+        userId,
+        checkoutId,
+        externalReference,
+        preferenceId: pref.preferenceId,
+        amount: adhesionFee,
+      });
+      res.json({
+        checkoutUrl: pref.checkoutUrl,
+        preferenceId: pref.preferenceId,
+        externalReference,
+        checkoutId,
+        amount: adhesionFee,
+      });
+    } catch (err) {
+      console.error("Error in /api/license/checkout-pro:", err);
+      const msg = err instanceof Error ? err.message : "Erro ao iniciar checkout";
+      if (msg.includes("MERCADOPAGO_ACCESS_TOKEN")) {
+        return res.status(503).json({ error: "Pagamento não configurado no servidor." });
+      }
+      res.status(500).json({ error: msg || "Erro ao iniciar checkout de licença" });
+    }
+  });
+
+  /**
+   * Mercado Pago — webhooks de pagamento (Checkout Pro).
+   * GET e POST: a documentação envia query (topic, id / data.id) e opcionalmente corpo JSON.
+   */
+  const mercadoPagoWebhook = async (req: express.Request, res: express.Response) => {
+    const hdr = req.headers as unknown as Record<string, unknown>;
+    const q = req.query as Record<string, unknown>;
+
+    const bodyObj = req.body && typeof req.body === "object" ? (req.body as Record<string, unknown>) : null;
+    console.log("[debug:license][/api/webhooks/mercadopago]", {
+      method: req.method,
+      query: q,
+      bodyKeys: bodyObj ? Object.keys(bodyObj) : [],
+      bodyType: bodyObj?.type,
+      bodyDataId: (bodyObj?.data as { id?: unknown } | undefined)?.id,
+      bodyId: bodyObj?.id,
+    });
+
+    try {
+      if (!isMercadoPagoConfigured()) {
+        logger.warn("[MP webhook] MERCADOPAGO_ACCESS_TOKEN ausente — ignorando notificação");
+        return res.status(503).send("Misconfigured");
+      }
+
+      if (process.env.MERCADOPAGO_WEBHOOK_SECRET?.trim()) {
+        const ok = verifyMercadoPagoWebhookSignatureFromEnv(hdr, q, req.body);
+        if (!ok) {
+          logger.warn("[MP webhook] assinatura x-signature inválida ou incompleta");
+          console.log("[debug:license][/api/webhooks/mercadopago] assinatura FALHOU (401)");
+          return res.status(401).send("Unauthorized");
+        }
+        console.log("[debug:license][/api/webhooks/mercadopago] assinatura OK");
+      } else {
+        logger.warn(
+          "[MP webhook] MERCADOPAGO_WEBHOOK_SECRET não definido — assinatura não validada (configure em produção)"
+        );
+      }
+
+      const topic = String(q.topic ?? q.type ?? "").toLowerCase();
+      if (topic && topic !== "payment" && topic !== "merchant_order") {
+        console.log("[debug:license][/api/webhooks/mercadopago] topic ignorado, ACK", { topic });
+        return res.status(200).send("OK");
+      }
+
+      if (topic === "merchant_order") {
+        const orderId = extractMerchantOrderIdFromNotification(req.body, q);
+        if (!orderId) {
+          console.log("[debug:license][/api/webhooks/mercadopago] merchant_order sem id, ACK");
+          return res.status(200).send("OK");
+        }
+        console.log("[debug:license][/api/webhooks/mercadopago] merchant_order id", orderId);
+        let orderJson: unknown;
+        try {
+          orderJson = await fetchMercadoPagoMerchantOrderById(orderId);
+        } catch (orderErr: unknown) {
+          const msg = orderErr instanceof Error ? orderErr.message : String(orderErr);
+          logger.error(`[MP webhook] merchant_orders/${orderId} falhou: ${msg}`);
+          console.log("[debug:license][/api/webhooks/mercadopago] merchant_order fetch ERRO", { orderId, msg });
+          return res.status(502).send("Merchant order fetch failed");
+        }
+        const order = orderJson as { payments?: unknown };
+        const rawList = order.payments;
+        const payList = Array.isArray(rawList) ? rawList : [];
+        console.log("[debug:license][/api/webhooks/mercadopago] merchant_order payments", payList.length);
+        for (const entry of payList) {
+          let row: MercadoPagoPaymentLike;
+          if (typeof entry === "number" || (typeof entry === "string" && /^\d+$/.test(entry.trim()))) {
+            const pid = String(entry).trim();
+            try {
+              row = await getMercadoPagoPaymentById(pid);
+            } catch (pe: unknown) {
+              logger.warn(
+                `[MP webhook] merchant_order: GET payment ${pid} (id na lista) falhou — ${pe instanceof Error ? pe.message : String(pe)}`
+              );
+              continue;
+            }
+          } else if (entry && typeof entry === "object") {
+            row = entry as MercadoPagoPaymentLike;
+          } else {
+            continue;
+          }
+          const pid = row.id != null ? String(row.id).trim() : "";
+          if (!/^\d+$/.test(pid)) continue;
+          let full: MercadoPagoPaymentLike = row;
+          const hasRef = typeof row.external_reference === "string" && row.external_reference.trim().length > 0;
+          const needsFetch =
+            !hasRef ||
+            row.status == null ||
+            row.transaction_amount == null ||
+            !row.currency_id;
+          if (needsFetch) {
+            try {
+              full = await getMercadoPagoPaymentById(pid);
+            } catch (pe: unknown) {
+              logger.warn(
+                `[MP webhook] merchant_order: GET payment ${pid} falhou — ${pe instanceof Error ? pe.message : String(pe)}`
+              );
+              continue;
+            }
+          }
+          const outcome = await tryActivateLicenseFromMercadoPagoPayment(full, pid);
+          if (outcome === "activated") {
+            return res.status(200).send("OK");
+          }
+        }
+        return res.status(200).send("OK");
+      }
+
+      const paymentId = extractPaymentIdFromNotification(req.body, q);
+      if (!paymentId) {
+        console.log("[debug:license][/api/webhooks/mercadopago] sem paymentId, ACK");
+        return res.status(200).send("OK");
+      }
+      console.log("[debug:license][/api/webhooks/mercadopago] paymentId", paymentId);
+
+      const isMpPaymentNotFoundError = (fetchErr: unknown): boolean => {
+        const e = fetchErr as { message?: string; status?: number; cause?: { status?: number } };
+        const msg = String(e?.message ?? fetchErr ?? "");
+        const httpStatus = e?.status ?? e?.cause?.status;
+        return (
+          httpStatus === 404 ||
+          /\bnot\s+found\b/i.test(msg) ||
+          /\b404\b/.test(msg)
+        );
+      };
+
+      const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+      /** MP pode notificar antes do GET /payments/:id consolidar (ex.: tela "processando pagamento"). */
+      const maxPaymentFetchAttempts = 8;
+      let payment: Awaited<ReturnType<typeof getMercadoPagoPaymentById>> | undefined;
+      let lastFetchErr: unknown;
+      for (let attempt = 1; attempt <= maxPaymentFetchAttempts; attempt++) {
+        try {
+          payment = await getMercadoPagoPaymentById(paymentId);
+          lastFetchErr = undefined;
+          break;
+        } catch (fetchErr: unknown) {
+          lastFetchErr = fetchErr;
+          if (isMpPaymentNotFoundError(fetchErr) && attempt < maxPaymentFetchAttempts) {
+            logger.warn(
+              `[MP webhook] GET payment ${paymentId} 404 (tentativa ${attempt}/${maxPaymentFetchAttempts}); nova tentativa após atraso.`
+            );
+            console.log("[debug:license][/api/webhooks/mercadopago] get payment 404 — retry", {
+              paymentId,
+              attempt,
+            });
+            await sleep(600 * attempt);
+            continue;
+          }
+          if (isMpPaymentNotFoundError(fetchErr)) {
+            logger.error(
+              `[MP webhook] GET payment ${paymentId} ainda 404 após ${maxPaymentFetchAttempts} tentativas. ` +
+                "Se o token estiver correto, o MP pode liberar o pagamento no próximo webhook (ex.: merchant_order). " +
+                "Respondendo 502 para o MP reenviar a notificação."
+            );
+            console.log("[debug:license][/api/webhooks/mercadopago] get payment 404 definitivo — 502 p/ retry MP", {
+              paymentId,
+            });
+            return res.status(502).send("Payment not visible or token mismatch");
+          }
+          throw fetchErr;
+        }
+      }
+      if (!payment) {
+        throw lastFetchErr ?? new Error("Falha ao obter pagamento MP");
+      }
+
+      const outcome = await tryActivateLicenseFromMercadoPagoPayment(payment, paymentId);
+      if (outcome === "activated") {
+        return res.status(200).send("OK");
+      }
+      return res.status(200).send("OK");
+    } catch (err) {
+      logger.error("[MP webhook] erro ao processar:", err);
+      console.log("[debug:license][/api/webhooks/mercadopago] ERRO 500", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return res.status(500).send("Error");
+    }
+  };
+
+  app.post("/api/webhooks/mercadopago", mercadoPagoWebhook);
+  app.get("/api/webhooks/mercadopago", mercadoPagoWebhook);
+
   app.get("/api/transactions", authenticateUser, async (req: any, res) => {
     try {
       const transactions = await db.prepare("SELECT id, amount, type, description, status, created_at as createdAt FROM transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT 50").all(req.user.id);
       const uniqueTransactions = Array.from(new Map(transactions.map((t: any) => [t.id, t]) as any).values());
+      const adhesion = uniqueTransactions.filter((t: any) => t.type === "ADHESION");
+      console.log("[debug:license][/api/transactions]", {
+        userId: req.user.id,
+        total: uniqueTransactions.length,
+        adhesionCount: adhesion.length,
+        lastTypes: uniqueTransactions.slice(0, 5).map((t: any) => t.type),
+      });
       res.json(uniqueTransactions);
     } catch (err) {
       console.error("Error in /api/transactions:", err);
@@ -1749,6 +2179,50 @@ async function startServer() {
     await db.prepare(`UPDATE users SET ${field} = ? WHERE id = ?`).run(value, id);
     
     logger.info(`[Admin] Usuário ${id} atualizado por ${req.user.id}: ${field} -> ${value}`);
+    res.json({ success: true });
+  }));
+
+  app.delete("/api/admin/users/:id", authenticateUser, authorizeAdmin, catchAsync(async (req: any, res) => {
+    const id = req.params.id?.trim();
+    if (!id) {
+      return res.status(400).json({ error: "ID obrigatório" });
+    }
+    if (id === req.user.id) {
+      return res.status(400).json({ error: "Não é possível excluir o próprio usuário logado." });
+    }
+
+    const target = (await db
+      .prepare("SELECT id, email, role FROM users WHERE id = ?")
+      .get(id)) as { id: string; email: string | null; role: string | null } | null;
+    if (!target) {
+      return res.status(404).json({ error: "Usuário não encontrado" });
+    }
+    const email = (target.email || "").toLowerCase();
+    if (target.role === "admin" || email === "consultorcredenciado@gmail.com") {
+      return res.status(403).json({ error: "Não é permitido excluir conta de administrador." });
+    }
+    if (id.startsWith("sys_")) {
+      return res.status(403).json({ error: "Não é permitido excluir usuários de sistema." });
+    }
+
+    await withTransaction(async () => {
+      await db.prepare("UPDATE users SET referrer_id = NULL WHERE referrer_id = ?").run(id);
+      await db.prepare("DELETE FROM user_badges WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM badges WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM push_subscriptions WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM matrix_history WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM matrix_cycles WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM matrix_positions WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM notifications WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM transactions WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM documents WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM mercadopago_deposit_orders WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM license_checkouts WHERE user_id = ?").run(id);
+      await db.prepare("DELETE FROM vouchers WHERE owner_id = ? OR recipient_id = ?").run(id, id);
+      await db.prepare("DELETE FROM users WHERE id = ?").run(id);
+    });
+
+    logger.info(`[Admin] Usuário ${id} excluído por ${req.user.id}`);
     res.json({ success: true });
   }));
 

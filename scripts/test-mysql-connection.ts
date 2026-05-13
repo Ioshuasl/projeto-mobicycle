@@ -1,8 +1,8 @@
 /**
  * Testa conexão MySQL usando variáveis de .env.example (ou sobrescritas por .env).
- * Uso: npm run db:test
+ * Uso: npm run db:test | npm run db:test:remote (IP do servidor de produção)
  *
- * Host remoto / IP sem alterar .env: defina DB_TEST_HOST (tem precedência sobre DB_HOST).
+ * Host remoto sem alterar DB_HOST no .env: DB_TEST_HOST (precedência sobre DB_HOST).
  * Ex.: npx cross-env DB_TEST_HOST=187.77.254.38 npm run db:test
  */
 import dotenv from 'dotenv';
@@ -58,6 +58,13 @@ async function main() {
     console.error('[db:test] Falha na conexão:', e.message || err);
     if (e.code) console.error('[db:test] code:', e.code);
     if (e.errno) console.error('[db:test] errno:', e.errno);
+    if (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED') {
+      console.error(
+        '\n[db:test] Dica: ETIMEDOUT/ECONNREFUSED costuma ser rede ou firewall (porta 3306 inacessível), MySQL só em 127.0.0.1, ' +
+          'ou ISP bloqueando saída na 3306. Credenciais erradas costumam falhar depois de conectar (erro de acesso). ' +
+          'No servidor: liberar 3306, bind-address=0.0.0.0 se for remoto, e GRANT para o host do cliente; ou use túnel SSH/VPN.\n'
+      );
+    }
     if (connection) {
       try {
         await connection.end();

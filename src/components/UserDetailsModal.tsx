@@ -19,7 +19,8 @@ import {
   ArrowDownRight,
   FileCheck,
   RefreshCw,
-  Save
+  Save,
+  Trash2
 } from 'lucide-react';
 import { User, Transaction } from '../types';
 import { formatCPF } from '../utils/validation';
@@ -31,10 +32,11 @@ interface UserDetailsModalProps {
   onClose: () => void;
   transactions: Transaction[];
   onUpdateDetail?: (userId: string, field: string, value: any) => Promise<boolean>;
+  onDeleteUser?: (userId: string) => void | Promise<void>;
   onViewReceipt?: (transaction: Transaction) => void;
 }
 
-export function UserDetailsModal({ user, isOpen, onClose, transactions, onUpdateDetail, onViewReceipt }: UserDetailsModalProps) {
+export function UserDetailsModal({ user, isOpen, onClose, transactions, onUpdateDetail, onDeleteUser, onViewReceipt }: UserDetailsModalProps) {
   const [formData, setFormData] = useState<any>(null);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -170,6 +172,16 @@ export function UserDetailsModal({ user, isOpen, onClose, transactions, onUpdate
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                {onDeleteUser && (
+                  <button
+                    type="button"
+                    onClick={() => void onDeleteUser(user.id)}
+                    className="flex items-center gap-2 px-4 py-3 bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 rounded-2xl text-sm font-bold transition-all"
+                  >
+                    <Trash2 size={18} />
+                    Excluir
+                  </button>
+                )}
                 {onUpdateDetail && (
                   <button 
                     onClick={handleSave}

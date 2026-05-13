@@ -426,6 +426,38 @@ export function AdminDashboard({
     }
   };
 
+  const handleDeleteUsuario = async (userId: string, userName?: string) => {
+    const label = userName?.trim() ? `"${userName.trim()}"` : userId;
+    if (!window.confirm(`Excluir permanentemente o usuário ${label}? Esta ação não pode ser desfeita.`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(userId)}`, {
+        method: 'DELETE',
+        headers: { 'x-user-id': user.id },
+      });
+      let errMsg = '';
+      try {
+        const body = await res.json();
+        errMsg = typeof body?.error === 'string' ? body.error : '';
+      } catch {
+        /* ignore */
+      }
+      if (!res.ok) {
+        alert(errMsg || `Erro ${res.status} ao excluir usuário`);
+        return;
+      }
+      if (selectedUser?.id === userId) {
+        setShowUserModal(false);
+        setSelectedUser(null);
+      }
+      await fetchUsers(userPage, searchTerm);
+      fetchData();
+    } catch {
+      alert('Erro de rede ao excluir usuário');
+    }
+  };
+
   const handleUpdateBanner = async (url?: string) => {
     const bannerToSave = url || newBannerUrl;
     if (!bannerToSave) return;
@@ -1394,9 +1426,27 @@ export function AdminDashboard({
                       </td>
                       <td className="px-6 py-4">
                         <div className="flex gap-2">
-
-                          <button className="p-2 bg-[var(--border-main)] hover:bg-[var(--glass-bg)] rounded-lg text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all">
+                          <button
+                            type="button"
+                            title="Editar (abre detalhes)"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleUserClick(u);
+                            }}
+                            className="p-2 bg-[var(--border-main)] hover:bg-[var(--glass-bg)] rounded-lg text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all"
+                          >
                             <Edit2 size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            title="Excluir usuário"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleDeleteUsuario(u.id, u.name);
+                            }}
+                            className="p-2 bg-red-500/10 hover:bg-red-500/20 rounded-lg text-red-400 hover:text-red-300 transition-all"
+                          >
+                            <Trash2 size={16} />
                           </button>
                         </div>
                       </td>
@@ -2759,6 +2809,7 @@ export function AdminDashboard({
           onClose={() => setShowUserModal(false)}
           transactions={transactions}
           onUpdateDetail={handleUpdateUserDetail}
+          onDeleteUser={(uid) => handleDeleteUsuario(uid, selectedUser?.name)}
           onViewReceipt={(t) => {
             setSelectedTransaction(t);
             setShowReceiptModal(true);

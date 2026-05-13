@@ -73,13 +73,16 @@ export {
 
 export {
   buildMercadoPagoWebhookSignatureManifest,
+  collectWebhookSignatureDataIdCandidates,
   computeMercadoPagoWebhookSignature,
   extractMerchantOrderIdFromNotification,
   extractNotificationTopic,
   extractPaymentIdFromNotification,
   extractPreferenceIdFromNotification,
   extractWebhookQueryDataId,
+  extractWebhookSignatureDataId,
   getMercadoPagoWebhookHeader,
+  normalizeMercadoPagoWebhookManifestDataId,
   parseMercadoPagoXsSignatureHeader,
   verifyMercadoPagoWebhookSignature,
   verifyMercadoPagoWebhookSignatureFromEnv,
@@ -88,6 +91,8 @@ export {
   type ParsedXsSignature,
   type VerifyMercadoPagoWebhookSignatureParams,
 } from './notifications.ts';
+
+export { fetchMercadoPagoMerchantOrderById } from './merchantOrder.ts';
 
 export {
   requestMercadoPagoClientCredentialsToken,

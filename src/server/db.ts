@@ -321,6 +321,25 @@ async function createSchema(): Promise<void> {
       UNIQUE KEY uk_mp_pref (preference_id),
       UNIQUE KEY uk_mp_payment (mp_payment_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+    `CREATE TABLE IF NOT EXISTS license_checkouts (
+      id VARCHAR(255) NOT NULL PRIMARY KEY,
+      user_id VARCHAR(255) NOT NULL,
+      external_reference VARCHAR(255) NOT NULL,
+      preference_id VARCHAR(255) NOT NULL,
+      amount DOUBLE NOT NULL,
+      currency_id VARCHAR(10) NOT NULL DEFAULT 'BRL',
+      status VARCHAR(50) NOT NULL DEFAULT 'PENDING',
+      mp_payment_id VARCHAR(255) NULL,
+      mp_payment_status VARCHAR(50) NULL,
+      activated_at DATETIME NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id),
+      UNIQUE KEY uk_license_checkouts_external_ref (external_reference),
+      UNIQUE KEY uk_license_checkouts_preference (preference_id),
+      UNIQUE KEY uk_license_checkouts_mp_payment (mp_payment_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
   ];
 
   for (const stmt of statements) {
@@ -341,6 +360,7 @@ async function createSchema(): Promise<void> {
     `CREATE INDEX idx_vouchers_recipient_id ON vouchers(recipient_id)`,
     `CREATE INDEX idx_matrix_cycles_user_id ON matrix_cycles(user_id)`,
     `CREATE INDEX idx_badges_user_id ON badges(user_id)`,
+    `CREATE INDEX idx_license_checkouts_user_created ON license_checkouts(user_id, created_at)`,
   ];
 
   for (const idx of indexes) {
