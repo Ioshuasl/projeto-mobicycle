@@ -13,6 +13,7 @@ import { createPushRoutes } from "./push_routes.ts";
 import { createMatrixRoutes } from "./matrix_routes.ts";
 import { createGamificationRoutes } from "./gamification_routes.ts";
 import { createAdminRoutes } from "./admin/index.ts";
+import { createDocsRoutes } from "./docs_routes.ts";
 
 export type ApiRouterDeps = {
   authLimiter: RequestHandler;
@@ -25,6 +26,8 @@ export type ApiRouterDeps = {
  */
 export function createApiRouter({ authLimiter }: ApiRouterDeps): Router {
   const api = Router();
+
+  api.use(createDocsRoutes());
 
   // Health
   api.get("/health", (_req, res) => {

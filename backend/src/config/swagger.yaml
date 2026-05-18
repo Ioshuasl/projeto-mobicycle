@@ -1,0 +1,1031 @@
+openapi: 3.0.3
+info:
+  title: Mobicycle API
+  description: |
+    API REST do Mobicycle (backend refatorado).
+
+    - **JWT**: use `Authorization: Bearer <token>` (obtido em `/auth/login` ou `/auth/register`).
+    - **Admin**: conta com e-mail `consultorcredenciado@gmail.com` ou role admin.
+    - Rate limit global em `/api/*` e limite extra em rotas de auth.
+  version: 1.0.0
+  contact:
+    name: Mobicycle
+
+servers:
+  - url: http://localhost:3000/api
+    description: Desenvolvimento local (backend)
+  - url: /api
+    description: Relativo ao host atual
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Session
+  - name: Users
+  - name: User
+  - name: License
+  - name: Webhooks
+  - name: Financial
+  - name: Documents
+  - name: Settings
+  - name: Notifications
+  - name: Push
+  - name: Matrix
+  - name: Gamification
+  - name: Admin
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token retornado por login ou register
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+        details:
+          type: array
+          items:
+            type: object
+
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        env:
+          type: string
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 4
+
+    RegisterRequest:
+      type: object
+      required: [name, email, password, cpf, phone]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 6
+        cpf:
+          type: string
+          example: "000.000.000-00"
+        phone:
+          type: string
+        nickname:
+          type: string
+        birthDate:
+          type: string
+        referrerId:
+          type: string
+        referralCode:
+          type: string
+        referrer_id:
+          type: string
+        firebaseUid:
+          type: string
+
+    AuthSession:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        name:
+          type: string
+        token:
+          type: string
+
+    Success:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Solicitar recuperação de senha
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                cpf:
+                  type: string
+      responses:
+        "200":
+          description: Token gerado ou mensagem genérica
+        "500":
+          description: Erro interno
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Redefinir senha com token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resetToken, newPassword]
+              properties:
+                resetToken:
+                  type: string
+                newPassword:
+                  type: string
+                  minLength: 6
+      responses:
+        "200":
+          description: Senha alterada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Success"
+        "400":
+          description: Token inválido ou expirado
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Sessão criada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+        "401":
+          description: Credenciais inválidas
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Cadastro de usuário
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "200":
+          description: Usuário criado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSession"
+        "400":
+          description: Validação ou e-mail/CPF duplicado
+
+  /me:
+    get:
+      tags: [Session]
+      summary: Perfil do usuário autenticado
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Perfil
+        "401":
+          description: Não autenticado
+
+  /init:
+    get:
+      tags: [Session]
+      summary: Bootstrap da sessão (settings, matrizes, transações, etc.)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Payload inicial do app
+
+  /users/{id}:
+    get:
+      tags: [Users]
+      summary: Perfil público de usuário
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Perfil
+        "403":
+          description: Acesso negado
+        "404":
+          description: Usuário não encontrado
+
+  /users/{id}/avatar:
+    get:
+      tags: [Users]
+      summary: Avatar do usuário (imagem ou redirect)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Imagem
+        "404":
+          description: Not found
+
+  /user/update:
+    post:
+      tags: [User]
+      summary: Atualizar conta
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Perfil atualizado
+
+  /user/referrals:
+    get:
+      tags: [User]
+      summary: Indicados diretos
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista de indicados
+
+  /user/network:
+    get:
+      tags: [User]
+      summary: Rede do usuário logado
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 10
+            maximum: 15
+      responses:
+        "200":
+          description: Árvore de rede
+
+  /user/activate:
+    post:
+      tags: [License]
+      summary: Ativação manual de licença
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: string
+      responses:
+        "200":
+          description: Licença ativada
+
+  /license/checkout-pro:
+    post:
+      tags: [License]
+      summary: Checkout Pro Mercado Pago (licença)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: URL ou dados do checkout
+        "503":
+          description: Mercado Pago não configurado
+
+  /webhooks/mercadopago:
+    get:
+      tags: [Webhooks]
+      summary: Verificação do webhook Mercado Pago
+      responses:
+        "200":
+          description: OK
+    post:
+      tags: [Webhooks]
+      summary: Notificações Mercado Pago
+      responses:
+        "200":
+          description: Processado
+
+  /transactions:
+    get:
+      tags: [Financial]
+      summary: Transações do usuário
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista de transações
+
+  /vouchers:
+    get:
+      tags: [Financial]
+      summary: Vouchers do usuário
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista de vouchers
+
+  /services/use-cashback:
+    post:
+      tags: [Financial]
+      summary: Usar cashback em serviço
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, serviceName]
+              properties:
+                amount:
+                  type: number
+                serviceName:
+                  type: string
+                  enum: [Corridas, Snack, Energy, "Bônus Guincho"]
+      responses:
+        "200":
+          description: Cashback debitado
+
+  /financial/deposit:
+    post:
+      tags: [Financial]
+      summary: Depósito em saldo
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount:
+                  type: number
+      responses:
+        "200":
+          description: Saldo atualizado
+
+  /financial/withdraw:
+    post:
+      tags: [Financial]
+      summary: Solicitar saque PIX
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, pixKey]
+              properties:
+                amount:
+                  type: number
+                pixKey:
+                  type: string
+      responses:
+        "200":
+          description: Saque solicitado
+
+  /vouchers/purchase:
+    post:
+      tags: [Financial]
+      summary: Comprar voucher com cashback
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount]
+              properties:
+                amount:
+                  type: number
+      responses:
+        "200":
+          description: Voucher criado
+
+  /vouchers/send:
+    post:
+      tags: [Financial]
+      summary: Enviar voucher
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [voucherId]
+              properties:
+                voucherId:
+                  type: string
+                recipientId:
+                  type: string
+                recipientEmail:
+                  type: string
+                recipientPhone:
+                  type: string
+      responses:
+        "200":
+          description: Voucher enviado
+
+  /documents:
+    get:
+      tags: [Documents]
+      summary: Documentos do usuário
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista
+
+  /documents/upload:
+    post:
+      tags: [Documents]
+      summary: Upload de documento
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Documento enviado
+
+  /settings/banner:
+    get:
+      tags: [Settings]
+      summary: URL do banner público
+      responses:
+        "200":
+          description: URL do banner
+    post:
+      tags: [Admin]
+      summary: Definir URL do banner (admin)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                url:
+                  type: string
+      responses:
+        "200":
+          description: OK
+
+  /settings/logo:
+    get:
+      tags: [Settings]
+      summary: URL do logo público
+      responses:
+        "200":
+          description: URL do logo
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: Notificações do usuário
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista
+
+  /notifications/{id}/read:
+    post:
+      tags: [Notifications]
+      summary: Marcar notificação como lida
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+
+  /push/vapid-public-key:
+    get:
+      tags: [Push]
+      summary: Chave pública VAPID
+      responses:
+        "200":
+          description: Chave
+
+  /push/subscribe:
+    post:
+      tags: [Push]
+      summary: Inscrever push notification
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Inscrito
+
+  /matrices/history:
+    get:
+      tags: [Matrix]
+      summary: Histórico de ciclos
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Ciclos
+
+  /matrices:
+    get:
+      tags: [Matrix]
+      summary: Matrizes abertas
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: type
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Matrizes com posições
+
+  /matrices/join:
+    post:
+      tags: [Matrix]
+      summary: Entrar em matriz
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId:
+                  type: string
+                referrerId:
+                  type: string
+      responses:
+        "200":
+          description: Posição preenchida
+
+  /matrices/reentry:
+    post:
+      tags: [Matrix]
+      summary: Reentrada em matriz
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId]
+              properties:
+                userId:
+                  type: string
+      responses:
+        "200":
+          description: Reentrada processada
+
+  /user/matrix/{targetId}:
+    get:
+      tags: [Matrix]
+      summary: Matrizes visíveis para um usuário alvo
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: targetId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Matrizes
+
+  /affiliates/leaderboard:
+    get:
+      tags: [Gamification]
+      summary: Leaderboard de afiliados
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Top 10
+
+  /rankings:
+    get:
+      tags: [Gamification]
+      summary: Rankings (indicações e ciclos)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Rankings
+
+  /user/achievements:
+    get:
+      tags: [Gamification]
+      summary: Conquistas do usuário
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Badges
+
+  /user/progress:
+    get:
+      tags: [Gamification]
+      summary: Progresso de carreira
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Progresso
+
+  /admin/users:
+    get:
+      tags: [Admin]
+      summary: Listar usuários (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: search
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Lista paginada
+
+  /admin/users/{id}/status:
+    post:
+      tags: [Admin]
+      summary: Alterar status do usuário
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+      responses:
+        "200":
+          description: OK
+
+  /admin/users/{id}/update:
+    post:
+      tags: [Admin]
+      summary: Atualizar campo do usuário (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field, value]
+              properties:
+                field:
+                  type: string
+                value: {}
+      responses:
+        "200":
+          description: OK
+
+  /admin/users/{id}:
+    delete:
+      tags: [Admin]
+      summary: Excluir usuário
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Excluído
+        "403":
+          description: Conta protegida
+
+  /admin/stats:
+    get:
+      tags: [Admin]
+      summary: Estatísticas do painel
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Dashboard stats
+
+  /admin/user/network/{userId}:
+    get:
+      tags: [Admin]
+      summary: Rede de um usuário (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: depth
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Rede
+
+  /admin/matrices/summary:
+    get:
+      tags: [Admin]
+      summary: Resumo de matrizes abertas
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Resumo
+
+  /admin/fill-matrix:
+    post:
+      tags: [Admin]
+      summary: Preencher posição na matriz (admin)
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [matrixId, userId]
+              properties:
+                matrixId:
+                  type: string
+                userId:
+                  type: string
+                referrerId:
+                  type: string
+      responses:
+        "200":
+          description: OK
+
+  /admin/matrix/{id}/details:
+    get:
+      tags: [Admin]
+      summary: Detalhes de uma matriz
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Matriz, posições, histórico e ciclos
+
+  /admin/documents:
+    get:
+      tags: [Admin]
+      summary: Todos os documentos (admin)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Lista
+
+  /admin/transactions:
+    get:
+      tags: [Admin]
+      summary: Transações (admin)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Últimas 100
+
+  /admin/transactions/{id}/clawback:
+    post:
+      tags: [Admin]
+      summary: Estorno de adesão (clawback)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Estorno processado
+
+  /settings/all:
+    get:
+      tags: [Admin]
+      summary: Todas as settings (admin)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Settings
+
+  /settings/update:
+    post:
+      tags: [Admin]
+      summary: Atualizar settings em lote
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                settings:
+                  type: object
+      responses:
+        "200":
+          description: OK
+
+  /admin/clear-image-cache:
+    post:
+      tags: [Admin]
+      summary: Limpar cache de imagens
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+
+  /generate-logo:
+    get:
+      tags: [Admin]
+      summary: Gerar logo (GET)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logo gerada
+
+  /admin/generate-logo:
+    post:
+      tags: [Admin]
+      summary: Gerar logo (POST)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logo gerada
+
+  /admin/reset-all:
+    post:
+      tags: [Admin]
+      summary: Reset total do sistema
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Sistema resetado
+
+  /admin/clear-ghosts:
+    post:
+      tags: [Admin]
+      summary: Remover entradas fantasmas nas matrizes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+
+  /admin/seed:
+    post:
+      tags: [Admin]
+      summary: Seed / reset
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+
+  /admin/force-reset:
+    post:
+      tags: [Admin]
+      summary: Force reset do sistema
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
