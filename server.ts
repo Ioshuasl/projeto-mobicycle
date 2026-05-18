@@ -130,7 +130,7 @@ async function tryActivateLicenseFromMercadoPagoPayment(
     console.log("[debug:license][/api/webhooks/mercadopago] license_checkouts NÃO encontrado", { extRef });
     return "skipped";
   }
-  console.log("[debug:license][/api/webhooks/mercadopago] checkout encontrado", {
+  console.log("[debug:license][routes/index.ts] checkout encontrado", {
     checkoutId: checkout.id,
     userId: checkout.user_id,
     status: checkout.status,

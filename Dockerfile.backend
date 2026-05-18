@@ -9,6 +9,7 @@ RUN npm ci
 # Copia arquivos do backend
 COPY server.ts email.ts tsconfig.json ./
 COPY src/server/ src/server/
+COPY src/utils/mercadopago/ src/utils/mercadopago/
 
 # S19: Run as non-root user
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup

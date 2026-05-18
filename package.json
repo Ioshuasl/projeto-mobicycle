@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "cross-env NODE_ENV=development tsx server.ts",
+    "dev:frontend": "vite",
+    "dev:backend": "npm run dev --prefix backend",
     "start": "cross-env NODE_ENV=production tsx server.ts",
     "build": "cross-env NODE_ENV=production vite build",
     "preview": "vite preview",
