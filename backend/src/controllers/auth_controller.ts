@@ -41,7 +41,7 @@ export const authController = {
 
     const result = await authService.register({
       ...validatedData,
-      referrerId: referrerId ?? validatedData.referrer_id,
+      referrerId: referrerId ?? validatedData.referrer_id ?? undefined,
       nickname,
       birthDate,
       referralCode,

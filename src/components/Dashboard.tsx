@@ -28,7 +28,6 @@ import {
   Sun,
   Moon,
   TrendingUp,
-  DollarSign,
   Upload,
   HandPlatter,
   Truck,
@@ -56,7 +55,6 @@ const DocumentManager = lazy(() => import('./DocumentManager').then(m => ({ defa
 const VoucherManager = lazy(() => import('./VoucherManager').then(m => ({ default: m.VoucherManager })));
 const UserDetailsModal = lazy(() => import('./UserDetailsModal').then(m => ({ default: m.UserDetailsModal })));
 const WithdrawalModal = lazy(() => import('./WithdrawalModal').then(m => ({ default: m.WithdrawalModal })));
-const DepositModal = lazy(() => import('./DepositModal').then(m => ({ default: m.DepositModal })));
 const Gamification = lazy(() => import('./Gamification').then(m => ({ default: m.Gamification })));
 const WelcomeBanner = lazy(() => import('./WelcomeBanner').then(m => ({ default: m.WelcomeBanner })));
 const ServiceUsage = lazy(() => import('./ServiceUsage').then(m => ({ default: m.ServiceUsage })));
@@ -142,7 +140,6 @@ export function Dashboard({
   const [showNotifications, setShowNotifications] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showWithdrawModal, setShowWithdrawModal] = useState(false);
-  const [showDepositModal, setShowDepositModal] = useState(false);
   const [showLevelUpModal, setShowLevelUpModal] = useState(false);
   const [lastLevelUpName, setLastLevelUpName] = useState('');
   const [showBannerAdmin, setShowBannerAdmin] = useState(false);
@@ -675,13 +672,6 @@ export function Dashboard({
               </div>
               <div className="flex flex-wrap items-center gap-4">
                 <button 
-                  onClick={() => setShowDepositModal(true)}
-                  className="px-6 py-3 bg-[var(--neon-blue)] hover:brightness-110 text-[#0a0f1e] font-black text-xs uppercase tracking-widest rounded-2xl transition-all shadow-xl shadow-blue-900/40 flex items-center gap-2"
-                >
-                  <DollarSign size={16} />
-                  Depositar
-                </button>
-                <button 
                   onClick={() => setShowWithdrawModal(true)}
                   className="px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-black text-xs uppercase tracking-widest rounded-2xl transition-all shadow-xl shadow-emerald-900/40 flex items-center gap-2"
                 >
@@ -1177,15 +1167,6 @@ export function Dashboard({
         </Suspense>
       )}
 
-      {showDepositModal && (
-        <Suspense fallback={null}>
-          <DepositModal 
-            user={user}
-            onClose={() => setShowDepositModal(false)}
-            onSuccess={onUpdateUser}
-          />
-        </Suspense>
-      )}
       <Suspense fallback={null}>
         <UserDetailsModal 
           user={selectedUserForModal}

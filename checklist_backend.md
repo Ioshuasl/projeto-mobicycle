@@ -302,20 +302,25 @@ Guia do agente: [`agent_backend.md`](agent_backend.md) · Cursor: `.github/agent
 | Módulo | Controller | Service | Repository |
 |--------|------------|---------|--------------|
 | Health | [ ] | — | — |
-| Settings | [ ] | [ ] | [ ] |
-| Notifications | [ ] | [ ] | [ ] |
-| Push | [ ] | [ ] | [ ] |
+| Settings | [x] | [x] | [x] |
+| Notifications | [x] | [x] | [x] |
+| Push | [x] | [x] | [x] |
 | Session | [x] | [x] | [x] |
 | Auth | [x] | [x] | [x] |
-| Users | [ ] | [ ] | [ ] |
-| User | [ ] | [ ] | [ ] |
-| Documents | [ ] | [ ] | [ ] |
-| License | [ ] | [ ] parcial (`license_service`) | [ ] |
-| Webhooks | [ ] | [ ] | — |
-| Financial | [ ] | [ ] parcial (`financial_manager`) | [ ] |
-| Matrix | [ ] | [ ] parcial (`matrix_manager`) | [ ] |
-| Gamification | [ ] | [ ] | [ ] |
-| Admin (5 arquivos) | [ ] | [ ] | [ ] |
+| Users | [x] | [x] | [x] |
+| User | [x] | [x] | [x] |
+| Documents | [x] | [x] | [x] |
+| License | [x] | [x] | [x] |
+| Webhooks | [x] | [x] | — |
+| Financial | [x] | [x] (depósito/saque/unilevel ainda em `financial_manager`) | [x] |
+| Matrix | [x] | [x] (join/reentry/split ainda em `matrix_manager`) | [x] |
+| Gamification | [x] | [x] | [x] |
+| Admin (5 arquivos) | [x] | [x] | [x] |
+| Admin/settings | [x] | [x] | [x] |
+| Admin/maintenance | [x] | [x] (reset em `user_manager`) | [x] |
+| Admin/matrices | [x] | [x] (fill em `matrix_manager`) | [x] |
+| Admin/transactions | [x] | [x] | [x] |
+| Admin/users | [x] | [x] | [x] |
 
 ## Próximas fases (Fase 3+)
 

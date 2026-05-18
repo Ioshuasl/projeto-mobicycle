@@ -11,6 +11,39 @@ import { generateReferralCode } from "../utils/referral.ts";
 
 const RESET_TOKEN_TTL_MS = 15 * 60 * 1000;
 
+function normalizeOptionalId(value: string | undefined | null): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
+}
+
+async function resolveReferrerForRegister(
+  referrerId?: string,
+  referralCode?: string
+): Promise<string | null> {
+  let finalReferrerId = normalizeOptionalId(referrerId);
+  const code = normalizeOptionalId(referralCode);
+
+  if (code && !finalReferrerId) {
+    const referrer = await userRepository.findReferrerByCodeOrNickname(code);
+    if (!referrer) {
+      throw new HttpError(400, "Código de indicação inválido.");
+    }
+    finalReferrerId = referrer.id;
+  }
+
+  if (finalReferrerId) {
+    const exists = await userRepository.existsById(finalReferrerId);
+    if (!exists) {
+      throw new HttpError(
+        400,
+        "Indicador inválido. Verifique o link ou código de indicação."
+      );
+    }
+  }
+
+  return finalReferrerId ?? null;
+}
+
 export type ForgotPasswordResult =
   | { success: true; message: string }
   | { success: true; resetToken: string };
@@ -119,15 +152,7 @@ export const authService = {
       throw new HttpError(400, "Este apelido já está sendo usado por outro usuário.");
     }
 
-    let finalReferrerId = referrerId;
-    if (referralCode && !finalReferrerId) {
-      const referrer = await userRepository.findReferrerByCodeOrNickname(referralCode);
-      if (referrer) {
-        finalReferrerId = referrer.id;
-      } else {
-        throw new HttpError(400, "Código de indicação inválido.");
-      }
-    }
+    const finalReferrerId = await resolveReferrerForRegister(referrerId, referralCode);
 
     const id = userRepository.createUserId();
     const newReferralCode = generateReferralCode(name);
@@ -143,7 +168,7 @@ export const authService = {
       cpf,
       phone,
       birthDate,
-      referrerId: finalReferrerId ?? null,
+      referrerId: finalReferrerId,
       referralCode: newReferralCode,
     });
 
